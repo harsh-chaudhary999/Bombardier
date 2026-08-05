@@ -18,7 +18,7 @@ Nine **logical operations**. Each maps to one tool on your server:
 | `bulk_create_tests` | `xray_bulk_create_tests` | Write-back — CREATE decisions |
 | `search_issues` | `jira_search_issues` | Test sync — bulk descriptions/labels; DEPRECATE label read |
 | `update_issue` | `jira_update_issue` | Write-back — DEPRECATE label write |
-| `add_comment` | `jira_add_comment` | Write-back — DEPRECATE rationale |
+| `add_comment` | `jira_add_comment` | Write-back — DEPRECATE rationale, and UPDATE prose recommendations |
 | `add_remote_link` | `jira_add_remote_link` | Write-back — link new tests to the source PRD |
 
 The defaults follow common Jira/Xray MCP naming. **If your server names them differently, that

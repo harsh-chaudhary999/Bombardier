@@ -3,14 +3,30 @@ Phase 5: Write-back approved decisions to Xray/Jira.
 
 After human review (Phase 4), approved decisions are synced back:
   KEEP      → mark written_back (no Xray action)
-  UPDATE    → update test steps/summary via xray_client
+  UPDATE    → replace summary/steps via xray_client; prose goes to a Jira comment
   DEPRECATE → add DEPRECATED label + comment via xray_client
   CREATE    → bulk-create new tests via xray_client
   QUESTION  → mark written_back (no Xray action)
+
+The UPDATE path is the only one that can lose data. Xray's `updateTestSteps` mutation
+replaces a test's whole step array rather than merging, so anything sent there overwrites
+the real steps irreversibly. Two rules follow, enforced in `_validated_steps` and the
+UPDATE branch:
+
+  * A step list is written only when it validates as a complete list of
+    {action, data, expectedResult} objects. One malformed item rejects the whole payload —
+    writing the valid prefix would delete every step after it.
+  * Prose is never converted into a step. An English recommendation has no step structure
+    to recover, so it is posted as a Jira comment for a human to apply, leaving the test's
+    structured fields untouched.
+
+On CREATE there are no existing steps to lose, so an *enumerated* outline is parsed into
+separate steps; free prose becomes the description instead of one step holding a paragraph.
 """
 import json
 import logging
 import os
+import re
 import time
 from typing import Any
 from urllib.parse import quote
@@ -21,14 +37,68 @@ from embeddings.pg_store import PGStore
 logger = logging.getLogger(__name__)
 
 
-def _steps_from_free_text(text: Any) -> list[dict] | None:
-    """Convert free-text step outline into a single manual step payload."""
-    if text is None:
+def _validated_steps(raw: Any) -> list[dict] | None:
+    """
+    Accept only a genuinely structured step list; return None for anything else.
+
+    Xray's `updateTestSteps` mutation **replaces** the whole step array — it does not merge.
+    So a malformed, partial or synthesised payload here does not degrade a test, it destroys
+    it: a 12-step manual test becomes whatever single item we sent. There is no undo.
+
+    Hence this is deliberately strict. Every item must be a dict carrying a non-empty
+    `action`; one bad item rejects the entire list rather than writing a truncated one.
+    """
+    if not isinstance(raw, list) or not raw:
         return None
-    s = text.strip() if isinstance(text, str) else str(text).strip()
-    if not s:
+    out: list[dict] = []
+    for i, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            return None
+        action = item.get("action")
+        if not isinstance(action, str) or not action.strip():
+            return None
+        out.append({
+            "action": action.strip(),
+            "data": str(item.get("data") or "").strip(),
+            "expectedResult": str(item.get("expectedResult") or item.get("result") or "").strip(),
+            "index": i,
+        })
+    return out
+
+
+# Matches an enumerated line: "1. x", "2) x", "- x", "* x", "• x", "Step 3: x"
+_OUTLINE_RE = re.compile(r"^\s*(?:\d+\s*[.)\-:]|[-*•]|step\s*\d+\s*[:.)\-])\s*(.+)$", re.IGNORECASE)
+# Splits an expected result off a step line: "do x -> y", "do x => y", "do x | Expected: y"
+_EXPECTED_RE = re.compile(r"\s*(?:->|=>|→|\|\s*expected\s*:|\bexpected\s*:)\s*", re.IGNORECASE)
+
+
+def _steps_from_outline(text: Any) -> list[dict] | None:
+    """
+    Split an *enumerated* outline into steps. Returns None for free-flowing prose.
+
+    Only used when creating a new test, where there are no existing steps to lose. The
+    enumeration requirement is the safeguard: if the model wrote a paragraph rather than a
+    list, we must not pretend it is a step — the caller stores it as the description
+    instead, which is honest about what we actually have.
+    """
+    if not isinstance(text, str) or not text.strip():
         return None
-    return [{"action": "other", "data": s, "expectedResult": ""}]
+    items: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        m = _OUTLINE_RE.match(line)
+        if not m:
+            continue
+        body = m.group(1).strip()
+        if not body:
+            continue
+        parts = _EXPECTED_RE.split(body, maxsplit=1)
+        items.append((parts[0].strip(), parts[1].strip() if len(parts) > 1 else ""))
+    if not items:
+        return None
+    return [
+        {"action": a, "data": "", "expectedResult": e, "index": i}
+        for i, (a, e) in enumerate(items, start=1)
+    ]
 
 
 def _resolve_prd_remote_url(prd_source: str, es_store: Any) -> str | None:
@@ -205,25 +275,26 @@ async def run_writeback(
                     if not jira_key:
                         errors.append({"decision_id": decision_id, "error": "UPDATE decision missing jira_key"})
                         continue
-                    summary = content.get("summary")
-                    steps = content.get("steps")
-                    suggested = content.get("suggested_changes")
-                    if suggested and not steps:
-                        steps = _steps_from_free_text(suggested)
-                    if summary or steps:
-                        await xray_client.update_test(jira_key, summary=summary, steps=steps)
-                    elif suggested:
-                        logger.warning(
-                            f"  UPDATE {jira_key}: suggested_changes empty after trim — skipping Xray update"
-                        )
+                    summary = (content.get("summary") or "").strip() or None
+                    raw_steps = content.get("steps")
+                    steps = _validated_steps(raw_steps)
+                    suggested = (content.get("suggested_changes") or "").strip()
+
+                    # A steps payload we cannot validate must never reach Xray. Sending it
+                    # would replace the test's real steps with a malformed list.
+                    if raw_steps and steps is None:
                         errors.append({
                             "decision_id": decision_id,
                             "jira_key": jira_key,
                             "action": "update",
-                            "error": "suggested_changes provided but empty after trim",
+                            "error": (
+                                "steps payload is not a valid list of {action,data,expectedResult} "
+                                "objects — refusing to replace the existing steps"
+                            ),
                         })
                         continue
-                    else:
+
+                    if not (summary or steps or suggested):
                         errors.append({
                             "decision_id": decision_id,
                             "jira_key": jira_key,
@@ -231,9 +302,30 @@ async def run_writeback(
                             "error": "UPDATE decision missing suggested_changes/steps/summary payload",
                         })
                         continue
+
+                    applied: list[str] = []
+                    if summary or steps:
+                        await xray_client.update_test(jira_key, summary=summary, steps=steps)
+                        if summary:
+                            applied.append("summary")
+                        if steps:
+                            applied.append(f"{len(steps)} steps")
+
+                    # Prose is a recommendation, not a step list. Turning it into a step was
+                    # what destroyed test content; it goes to a comment so the reviewer sees
+                    # it and the structured fields stay intact.
+                    if suggested:
+                        await xray_client.add_comment(
+                            jira_key,
+                            "[QA Intelligence Engine] Suggested update — review and apply manually.\n\n"
+                            f"{suggested}"
+                            + (f"\n\nReason: {reason}" if reason else ""),
+                        )
+                        applied.append("comment")
+
                     pg_store.mark_written_back(decision_id)
                     counts["update"] += 1
-                    logger.info(f"  Updated {jira_key}")
+                    logger.info("  Updated %s (%s)", jira_key, ", ".join(applied))
 
                 elif action == "deprecate":
                     if not jira_key:
@@ -258,17 +350,24 @@ async def run_writeback(
                         "summary": content.get("summary", "New test case"),
                         "testType": "Manual",
                     }
-                    if content.get("suggested_steps"):
-                        steps = _steps_from_free_text(content["suggested_steps"])
-                        if steps:
-                            new_test["steps"] = steps
+                    # Nothing exists yet, so there is nothing to destroy — but a paragraph
+                    # masquerading as a single step still makes a useless test. Prefer
+                    # structured steps, then an enumerated outline, then the description.
+                    structured = _validated_steps(content.get("steps"))
+                    outline = content.get("suggested_steps")
+                    if structured:
+                        new_test["steps"] = structured
+                    elif outline and str(outline).strip():
+                        parsed = _steps_from_outline(outline)
+                        if parsed:
+                            new_test["steps"] = parsed
                         else:
-                            errors.append({
-                                "decision_id": decision_id,
-                                "action": "create",
-                                "error": "CREATE decision has empty suggested_steps",
-                            })
-                            continue
+                            new_test["description"] = str(outline).strip()
+                            logger.info(
+                                "  CREATE %r: step outline is prose, not an enumerated list — "
+                                "storing it as the description instead of a single bogus step",
+                                new_test["summary"],
+                            )
                     prd_src = decision.get("prd_source") or ""
                     create_queue.append((decision_id, new_test, prd_src))
 

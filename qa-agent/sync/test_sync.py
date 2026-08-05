@@ -67,16 +67,43 @@ def _content_hash(test: dict) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def _extract_updated(test: dict) -> str:
+    """
+    Jira's `updated` timestamp from the bulk listing, if the MCP server returns it.
+
+    Optional by design: tool shape is configuration here, so a server that does not expose
+    the field simply yields "" and the diff behaves as it did before.
+    """
+    for container in (test, test.get("jira") or {}, test.get("fields") or {}):
+        if isinstance(container, dict):
+            v = container.get("updated")
+            if v:
+                return str(v)
+    return ""
+
+
 def _metadata_hash(test: dict) -> str:
     """
     Hash of fields available before description/steps are fetched (Phase 3 diff).
     Tests whose metadata_hash matches the stored hash can skip Phase 4 API calls.
+
+    Known blind spot. These are the only fields the bulk listing returns, so a test whose
+    *steps*, *description* or *preconditions* changed while its summary, folder, labels and
+    type stayed put hashes identically and never reaches Phase 4 — Elasticsearch then serves
+    stale content indefinitely, and the agent compares PRDs against a test that no longer
+    says what the index thinks it says.
+
+    Including Jira's `updated` timestamp closes this for anything that touches the Jira
+    issue. Xray Cloud keeps step definitions in its own store, so a steps-only edit may not
+    move that timestamp; `run_sync(full_content_refresh=True)` exists for that case, and the
+    residual gap is counted and reported rather than left silent.
     """
     payload = json.dumps({
         "summary":  test.get("summary", ""),
         "folder":   _extract_folder_path(test),
         "labels":   sorted(test.get("labels") or []),
         "testType": _extract_test_type(test),
+        "updated":  _extract_updated(test),
     }, sort_keys=True)
     return hashlib.sha256(payload.encode()).hexdigest()
 
@@ -242,10 +269,17 @@ async def run_sync(
     pg_store,
     run_id: str | None = None,
     folder_path: str = "",
+    full_content_refresh: bool = False,
 ) -> dict:
     """
     Full test sync pipeline. Returns a summary dict when done.
     Called via asyncio.create_task() — runs in background.
+
+    full_content_refresh forces Phase 4 to fetch steps/description/preconditions for every
+    test rather than only those whose bulk metadata changed. That costs one MCP call per test,
+    so it is off by default; run it periodically to catch edits the bulk listing cannot see
+    (see `_metadata_hash`). The summary reports `content_unverified` either way, so the size
+    of the blind spot on a normal run is visible instead of implicit.
     """
     run_id = run_id or str(uuid.uuid4())
     t_total = time.monotonic()
@@ -373,15 +407,23 @@ async def run_sync(
             stale_keys = set(existing_hashes.keys()) - fetched_keys
 
         candidates: list[dict] = []
+        content_unverified = 0
+        saw_updated_field = False
         for t_item in fetched:
             k = _get_key(t_item)
             if not k:
                 continue
+            if _extract_updated(t_item):
+                saw_updated_field = True
             stored = existing_meta.get(k)
             if stored is None:
                 candidates.append(t_item)  # new test
+            elif full_content_refresh:
+                candidates.append(t_item)  # caller asked for content verification of everything
             elif stored["metadata_hash"] and stored["metadata_hash"] == _metadata_hash(t_item):
-                pass  # metadata unchanged — skip Phase 4 API calls; post-fetch re-diff still runs
+                # Metadata unchanged — skip Phase 4 API calls. Steps/description edits that
+                # never touched the bulk-listed fields are invisible here; counted, not hidden.
+                content_unverified += 1
             else:
                 candidates.append(t_item)  # metadata changed or legacy doc (no metadata_hash)
 
@@ -390,6 +432,17 @@ async def run_sync(
             f"candidates={len(candidates)} | unchanged={len(fetched)-len(candidates)} | "
             f"stale={len(stale_keys)} ({_elapsed(t)})"
         )
+        if content_unverified:
+            logger.warning(
+                "[%s]   %s test(s) skipped Phase 4 on bulk metadata alone — their steps and "
+                "descriptions were NOT re-read, so a content-only edit in Xray stays stale in "
+                "the index. Jira `updated` %s in this listing. Run with "
+                "full_content_refresh=true to verify all content.",
+                run_id,
+                content_unverified,
+                "is present and included in the diff" if saw_updated_field
+                else "is NOT exposed by the MCP server, widening this gap",
+            )
 
         # ── Phase 4: Bulk description + label fetch ───────────────────────
         t = time.monotonic()
@@ -528,6 +581,10 @@ async def run_sync(
             "unchanged": len(fetched) - len(to_upsert),
             "deleted":   deleted,
             "elapsed":   _elapsed(t_total),
+            # How many tests were declared unchanged without re-reading their steps or
+            # description. Non-zero means the index may hold stale content for those tests.
+            "content_unverified": content_unverified,
+            "full_content_refresh": full_content_refresh,
         }
         await append_entry_async(
             "test_sync",

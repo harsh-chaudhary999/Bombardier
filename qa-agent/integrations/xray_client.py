@@ -540,6 +540,20 @@ async def add_remote_link(issue_key: str, url: str, title: str = "PRD Source") -
     })
 
 
+async def add_comment(issue_key: str, comment: str) -> Any:
+    """
+    Add a Jira comment to an issue.
+
+    This is the non-destructive channel for anything the agent produced as prose. A
+    recommendation written in English cannot be applied to a test's structured fields
+    without inventing structure, so it is recorded here for the reviewer instead.
+    """
+    return await _call("add_comment", {
+        "issueKey": _validate_jira_key(issue_key),
+        "comment": comment,
+    })
+
+
 async def deprecate_test(test_key: str, reason: str) -> None:
     """
     Mark a test as deprecated: appends DEPRECATED label + a comment explaining why.

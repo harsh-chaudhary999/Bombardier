@@ -50,7 +50,7 @@ Bombardier closes that gap automatically:
 | 2 | **PRD Ingestion** | PRDs are chunked semantically (embedding-based boundary detection), embedded with BAAI/bge-m3, and stored in `qa_prd_chunks`. Sources: Confluence page, Confluence space, GitLab folder, GitLab file, or direct file upload. |
 | 3 | **LLM Analysis** | A LangChain ReAct agent iterates over PRD sections. For each section it searches the test index (hybrid KNN + BM25), inspects individual tests, checks prior decisions, and records one of: `keep / update / deprecate / create / question`. |
 | 4 | **Human Review** | Decisions land in a Streamlit dashboard. Reviewers approve or reject each decision. Nothing touches Xray until approval. |
-| 5 | **Write-back** | Approved decisions are flushed to Xray/Jira via MCP: test steps updated, DEPRECATED labels added, new tests bulk-created (up to 50 at a time). |
+| 5 | **Write-back** | Approved decisions are flushed to Xray/Jira via MCP: validated step lists replace a test's steps, prose recommendations are posted as Jira comments instead, DEPRECATED labels added, new tests bulk-created (up to 50 at a time). |
 
 ### Retrieval Stack
 
@@ -190,6 +190,44 @@ docker exec -i qa-postgres psql -U qa -d qa < init-db/03-sync-runs-status.sql
 | `AZURE_OPENAI_ENDPOINT` | — | Azure OpenAI endpoint |
 | `AZURE_OPENAI_API_KEY` | — | Azure OpenAI key |
 | `AZURE_OPENAI_API_VERSION` | `2024-08-01-preview` | Azure OpenAI API version |
+| `QA_REASONING_PROVIDER` | — | Provider for `tier: "reasoning"`; must be set together with the model |
+| `QA_REASONING_MODEL` | — | Model for `tier: "reasoning"`; half-configured tiers warn and do not escalate |
+
+### Local inference with Ollama
+
+Ollama runs on the **host**, not in Compose. Two things must both be true, and the second is
+the one that bites:
+
+**1. The container must resolve the host.** Already handled — `docker-compose.yml` sets
+`extra_hosts: host.docker.internal:host-gateway`.
+
+**2. Ollama must listen beyond loopback.** By default it binds `127.0.0.1:11434` only, so it
+*refuses* connections on the bridge address `host.docker.internal` resolves to. Symptom: every
+`provider=ollama` request fails with a connection error — `/ask` returns HTTP 500 — while
+`curl localhost:11434` works fine from the host, which makes it look like Ollama is healthy.
+
+Confirm the gap before changing anything (the second command failing is the bug):
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:11434/api/version && \
+curl -s -o /dev/null -w '%{http_code}\n' "http://$(ip -4 addr show docker0 | grep -oP 'inet \K[\d.]+'):11434/api/version"
+```
+
+Fix it by overriding the systemd unit:
+
+```bash
+sudo mkdir -p /etc/systemd/system/ollama.service.d
+printf '[Service]\nEnvironment="OLLAMA_HOST=0.0.0.0:11434"\n' | sudo tee /etc/systemd/system/ollama.service.d/override.conf
+sudo systemctl daemon-reload && sudo systemctl restart ollama
+```
+
+`0.0.0.0` exposes Ollama on every interface, so it belongs behind a host firewall. To limit it
+to Docker only, use the bridge address instead (`OLLAMA_HOST=172.17.0.1:11434`) — but note the
+host CLI then needs the same value exported to reach it.
+
+Also set `OLLAMA_NUM_CTX`. Ollama's default window is a few thousand tokens regardless of what
+the model advertises, and anything beyond it is dropped **without error** — the agent simply
+never sees the end of the PRD.
 
 ---
 
@@ -207,7 +245,7 @@ All endpoints accept and return JSON. Rate limits apply per IP. Set `X-API-Key` 
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/sync/tests` | Start an Xray → Elasticsearch sync. Body: `{project_key, folder_path?}`. Returns `run_id`. |
+| `POST` | `/sync/tests` | Start an Xray → Elasticsearch sync. Body: `{project_key, folder_path?, full_content_refresh?}`. Returns `run_id`. |
 | `GET` | `/sync/status/{run_id}` | Poll sync progress. |
 
 ### Phase 2 — PRD Ingestion
@@ -268,6 +306,13 @@ embedding model**, where versions still match but the stored vectors are no long
 
 `dry_run: true` returns a preview of what would be written without making any Xray/Jira calls.
 
+**Step replacement is destructive.** Xray's `updateTestSteps` overwrites a test's entire step
+array rather than merging, so write-back only sends a step list that validates as a complete
+set of `{action, data, expectedResult}` objects — a single malformed entry rejects the whole
+payload rather than truncating the test. An agent recommendation written as prose is never
+converted into a step; it is posted as a Jira comment for a human to apply. The review UI
+shows the full replacement step list, with a warning, before Approve is available.
+
 ### Evaluation & Observability
 
 | Method | Path | Description |
@@ -322,6 +367,28 @@ curl -s -X POST $BASE/sync/tests \
 curl $BASE/sync/status/$RUN
 # {"status":"completed","tests_synced":423,"elapsed_s":14.2}
 ```
+
+**Incremental sync has a content blind spot.** Xray's bulk listing returns only key, summary,
+labels, folder, test type and Jira's `updated` timestamp, so that is all the incremental diff
+can compare. Steps and descriptions are fetched separately at one MCP call per test, which is
+why unchanged tests skip that phase. Xray Cloud stores step definitions outside the Jira issue,
+so a steps-only edit may not move `updated` — such a test hashes identically and keeps its
+stale steps in the index.
+
+The sync summary reports `content_unverified`: how many tests were accepted as unchanged
+without re-reading their content. When that number matters, force a full read:
+
+```bash
+curl -s -X POST $BASE/sync/tests \
+  -H "Content-Type: application/json" \
+  -d '{"project_key": "PROJ", "full_content_refresh": true}'
+```
+
+A reasonable pattern is incremental on the nightly schedule and `full_content_refresh` weekly.
+
+> Adding `updated` to the diff changed the hash inputs, so the first sync after upgrading
+> treats every test as a candidate and re-reads all content once. That is intended — hashes
+> computed before this change carry no content signal and cannot be trusted.
 
 ---
 

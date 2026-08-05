@@ -908,6 +908,7 @@ def _make_tools(prd_source_id: str, module: list[str] | None,
         new_test_summary: str | None = None,
         new_test_steps: str | None = None,
         prd_section: str | None = None,
+        updated_steps: list[dict] | None = None,
     ) -> str:
         """
         Record a coverage decision for human review.
@@ -917,10 +918,20 @@ def _make_tools(prd_source_id: str, module: list[str] | None,
             action:             One of: "keep", "update", "deprecate", "create", "question"
             reason:             Clear explanation of why you made this decision
             jira_key:           The test case key (required for keep/update/deprecate; omit for create)
-            suggested_changes:  For "update" — describe exactly what needs changing in the test
+            suggested_changes:  For "update" — describe in prose exactly what needs changing.
+                                This is recorded as a Jira comment for a human to apply; it is
+                                never converted into test steps.
             new_test_summary:   For "create" — the proposed test case title
-            new_test_steps:     For "create" — outline of the test steps
+            new_test_steps:     For "create" — outline of the test steps. Number them
+                                ("1. …", "2. …", one per line) so they import as separate
+                                steps; unnumbered prose becomes the test description instead.
             prd_section:        Which PRD section triggered this decision (optional but helpful)
+            updated_steps:      For "update" — ONLY when you can supply the COMPLETE new step
+                                list. Xray replaces all steps with what you provide, so a
+                                partial list permanently deletes the rest. Each item is
+                                {"action": "...", "data": "...", "expectedResult": "..."}.
+                                If you are not rewriting every step, leave this out and
+                                describe the change in suggested_changes instead.
         """
         valid_actions = ("keep", "update", "deprecate", "create", "question")
         if action not in valid_actions:
@@ -959,8 +970,14 @@ def _make_tools(prd_source_id: str, module: list[str] | None,
             )
 
         updated_content = None
-        if action == "update" and suggested_changes:
-            updated_content = {"suggested_changes": suggested_changes}
+        if action == "update" and (suggested_changes or updated_steps):
+            updated_content = {}
+            if suggested_changes:
+                updated_content["suggested_changes"] = suggested_changes
+            if updated_steps:
+                # Stored as-is; writeback validates the shape and refuses to send anything
+                # it cannot verify, because Xray replaces the whole step array.
+                updated_content["steps"] = updated_steps
         elif action == "create":
             updated_content = {
                 "summary":         new_test_summary,

@@ -81,6 +81,16 @@ def _install_stubs() -> None:
             {"psycopg2": pg, "psycopg2.pool": pool, "psycopg2.extras": extras}
         )
 
+    if "mcp" not in sys.modules:
+        mcp = types.ModuleType("mcp")
+        mcp.ClientSession = object
+        client = types.ModuleType("mcp.client")
+        http = types.ModuleType("mcp.client.streamable_http")
+        http.streamablehttp_client = lambda *a, **k: None
+        sys.modules.update(
+            {"mcp": mcp, "mcp.client": client, "mcp.client.streamable_http": http}
+        )
+
 
 _install_stubs()
 from agents import analysis_agent as A  # noqa: E402

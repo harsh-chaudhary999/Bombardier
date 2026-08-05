@@ -74,6 +74,10 @@ services:
       - AZURE_OPENAI_API_VERSION=${AZURE_OPENAI_API_VERSION:-2024-08-01-preview}
       # Local inference (provider="ollama"). Ollama runs on the HOST, not in Compose —
       # host.docker.internal resolves via extra_hosts above.
+      # That resolution is necessary but NOT sufficient: Ollama binds 127.0.0.1 by default,
+      # so it refuses the bridge address this name resolves to and every ollama-backed
+      # request fails with a connection error. Ollama must also listen beyond loopback —
+      # set OLLAMA_HOST on the host service (see README, "Local inference with Ollama").
       # OLLAMA_NUM_CTX is mandatory in practice: Ollama's default window is a few
       # thousand tokens no matter what the model supports, and overflow is dropped silently.
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}

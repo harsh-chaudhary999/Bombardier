@@ -43,6 +43,7 @@ from ingestion.prd_pipeline import run_ingest, run_file_ingest
 from agents.analysis_agent import run_analysis, build_preview, validate_prd_data
 from agents.writeback import run_writeback
 from agents.incremental import run_incremental_analysis
+from embeddings.rank_filter import relative_cut, separation
 from embeddings.reranker import Reranker
 from observability.phase_ledger import verify_ledger_writable
 from observability.request_norm import normalize_module_list
@@ -202,6 +203,7 @@ async def _run_sync_with_optional_retry(
     project_key: str,
     run_id: str,
     folder_path: str,
+    full_content_refresh: bool = False,
 ) -> dict:
     """
     Run test sync; on transient MCP/Xray errors optionally sleep and retry in-process
@@ -221,6 +223,7 @@ async def _run_sync_with_optional_retry(
                 pg_store=app.state.pg_store,
                 run_id=run_id,
                 folder_path=folder_path,
+                full_content_refresh=full_content_refresh,
             )
         except Exception as e:
             if not enabled or attempt >= len(delays) or not _is_retryable_mcp_error(e):
@@ -466,6 +469,9 @@ def health(request: Request):
 class SyncTestsRequest(BaseModel):
     project_key: str
     folder_path: str = ""   # empty = all tests in the project
+    # Re-read steps/description for every test instead of trusting the bulk metadata diff.
+    # Costs one MCP call per test; see sync.test_sync._metadata_hash for why it is needed.
+    full_content_refresh: bool = False
 
 
 @app.post("/sync/tests", status_code=202)
@@ -480,6 +486,11 @@ async def sync_tests(request: Request, req: SyncTestsRequest):
     Body:
         project_key  — Jira project key, e.g. "PROJ"
         folder_path  — (optional) restrict sync to one folder, e.g. "/Platform"
+        full_content_refresh — (optional) re-read steps/description for every test. The
+                       default incremental diff only sees summary/folder/labels/type/updated
+                       from the bulk listing, so a steps-only edit in Xray can stay stale in
+                       the index; the response field `content_unverified` reports how many
+                       tests were accepted without a content read.
     """
     run_id = str(uuid.uuid4())
 
@@ -489,6 +500,7 @@ async def sync_tests(request: Request, req: SyncTestsRequest):
             project_key=req.project_key,
             run_id=run_id,
             folder_path=req.folder_path,
+            full_content_refresh=req.full_content_refresh,
         ),
     )
 
@@ -812,6 +824,17 @@ class SearchPRDRequest(BaseModel):
     query: str                    # free-text query or PRD topic
     source_id: str | None = None  # optional: restrict to one ingested document
     top_k: int = Field(default=10, ge=1, le=200)
+    module: list[str] | None = None
+    # Structural scoping — the same filters /ask exposes. Requirements are a small
+    # fraction of a whole-space ingest, so doc_types=["prd"] removes far more noise
+    # than any score threshold can.
+    title_contains: str | None = None
+    doc_types: list[str] | None = None
+    exclude_doc_types: list[str] | None = None
+    # Trim the tail at the largest relative score drop. Off by default so the endpoint
+    # keeps returning what was asked for; the `separation` block is reported either way
+    # so a caller can see whether score is worth trusting before opting in.
+    trim: bool = False
 
 
 @app.post("/search/prd")
@@ -840,14 +863,27 @@ async def search_prd(request: Request, req: SearchPRDRequest):
             query_embedding=query_vec,
             top_k=req.top_k,
             source_id=req.source_id,
+            module_filter=normalize_module_list(req.module),
+            title_contains=req.title_contains,
+            doc_types=req.doc_types,
+            exclude_doc_types=req.exclude_doc_types,
         ),
     )
 
+    # Score distributions on this corpus are heavily compressed — a correct answer and an
+    # unrelated page can land within a few percent of each other, which makes every absolute
+    # threshold useless. `separation` says whether score can discriminate at all, so a caller
+    # can tell a confident ranking from a flat one instead of assuming rank order means something.
+    kept, diag = relative_cut(results, min_keep=min(3, len(results)) or 1) if req.trim \
+        else (results, separation(results))
+
     return {
-        "query":     req.query,
-        "source_id": req.source_id,
-        "total":     len(results),
-        "results":   results,
+        "query":      req.query,
+        "source_id":  req.source_id,
+        "total":      len(kept),
+        "retrieved":  len(results),
+        "separation": diag,
+        "results":    kept,
     }
 
 

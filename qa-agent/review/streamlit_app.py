@@ -303,8 +303,32 @@ def _render_decision_card(d: dict, color: str):
                 except (json.JSONDecodeError, TypeError):
                     pass
             if isinstance(content, dict):
+                steps = content.get("steps")
                 for k, v in content.items():
+                    if k == "steps":
+                        continue  # rendered below as a table, not as a Python repr
                     st.markdown(f"- **{k}:** {v}")
+
+                # A step list is the only payload here that destroys data. Xray replaces the
+                # whole array rather than merging, so the reviewer has to see exactly what
+                # the test will be reduced to before approving.
+                if isinstance(steps, list) and steps:
+                    st.warning(
+                        f"Approving **replaces all steps** on {jira_key} with the "
+                        f"{len(steps)} below. Xray does not merge step lists, and this "
+                        f"cannot be undone."
+                    )
+                    st.table([
+                        {
+                            "#": i,
+                            "Action": (s or {}).get("action", "") if isinstance(s, dict) else str(s),
+                            "Data": (s or {}).get("data", "") if isinstance(s, dict) else "",
+                            "Expected Result": (
+                                (s or {}).get("expectedResult") or (s or {}).get("result") or ""
+                            ) if isinstance(s, dict) else "",
+                        }
+                        for i, s in enumerate(steps, start=1)
+                    ])
             else:
                 st.code(str(content))
 
