@@ -1,0 +1,50 @@
+# Web framework
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+slowapi==0.1.9
+
+# MCP client (HTTP Streamable transport; endpoint from XRAY_MCP_URL)
+mcp>=1.4.0
+
+# LangChain chat-model adapters for the analysis agent's tool-calling loop.
+# langgraph was removed — nothing imported it; the ReAct loop is hand-written in
+# agents/analysis_agent.py:_run_agent_loop.
+# No exact pins — langchain-core is a shared transitive dep of all three adapters and
+# pinning one adapter tends to conflict with the others. TODO: replace with a lockfile
+# (pip-compile / uv) so builds are reproducible instead of merely resolvable.
+langchain-anthropic>=0.3.3
+langchain-openai>=0.2.12
+langchain-ollama>=0.2.2   # local inference (provider="ollama"); needs a tool-calling model
+
+# Local embeddings — BAAI/bge-m3 (1024 dim, multilingual, asymmetric)
+# Queries use instruction prefix; documents encoded without instruction
+# torch is installed separately in the Dockerfile via PyTorch's own index URL
+sentence-transformers>=5.1.0
+
+# PostgreSQL (relational data: pending_decisions, sync_runs)
+psycopg2-binary==2.9.10
+
+# Elasticsearch (vector store: test case + PRD chunk embeddings)
+elasticsearch[async]==8.17.0
+
+# Document ingestion
+pymupdf==1.24.14          # PDF text extraction
+pdfplumber==0.11.4        # PDF table extraction
+python-docx==1.1.2        # DOCX parsing
+openpyxl==3.1.5           # Excel (.xlsx) parsing
+html2text==2024.2.26      # HTML → Markdown (Confluence)
+markdownify==0.13.1       # HTML → Markdown (fallback)
+requests==2.32.3          # Confluence REST API, Jira REST API
+httpx==0.28.1             # Async HTTP (MCP server calls)
+python-multipart==0.0.12  # FastAPI file upload support
+
+# Scheduling (nightly sync)
+apscheduler==3.10.4
+
+# Utilities
+python-dotenv==1.0.1
+pydantic==2.10.3
+pydantic-settings==2.6.1
+
+# Text processing
+tiktoken==0.8.0           # Token counting for chunker

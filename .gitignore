@@ -1,0 +1,72 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Environment and secrets (never commit)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+**/credentials.json
+**/cursor-mcp-config.json
+**/mcp-config.local.json
+**/*-mcp-config.local.json
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs and local data
+*.log
+logs/
+tmp/
+temp/
+
+# Model / HF caches (large)
+.cache/
+models_cache/
+
+# Node (includes optional local MCP server working copies)
+node_modules/
+npm-debug.log*
+
+# Docker overrides
+docker-compose.override.yml
+docker-compose.local.yml
+
+# Coverage / test artifacts
+.coverage
+htmlcov/
+coverage.xml
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local eval & audit data — holds real PRD content, Jira keys and query text.
+# phase-ledger.jsonl and payload-trace.jsonl default into qa-agent/eval/ and record
+# verbatim request/response payloads. Keep all of it local; commit only the template.
+qa-agent/eval/*.jsonl
+qa-agent/eval/ground_truth*.json
+!qa-agent/eval/ground_truth.example.json
+qa-agent/eval/*.results.json
+qa-agent/eval/*.failures.json

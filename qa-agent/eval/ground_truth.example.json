@@ -1,0 +1,22 @@
+{
+  "_description": "Ground truth dataset for retrieval evaluation. Add your own labeled pairs.",
+  "_instructions": [
+    "Each entry maps a search query to the jira_keys that SHOULD be retrieved.",
+    "expected_keys: list of jira_keys that are definitely relevant (must-find)",
+    "module: optional module filter to apply during search",
+    "Run: python -m eval.benchmark --ground-truth eval/ground_truth.json"
+  ],
+  "queries": [
+    {
+      "query": "Example section — replace with a real PRD excerpt and expected test keys from your project.",
+      "prd_source_id": "confluence:123456789",
+      "prd_section": "Example section heading",
+      "module": "ExampleModule",
+      "expected_keys": [
+        "PROJ-10001",
+        "PROJ-10002"
+      ],
+      "notes": "Replace with human-verified keys from your Xray project."
+    }
+  ]
+}

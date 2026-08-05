@@ -1,0 +1,7 @@
+# Streamlit review UI — lightweight, no torch/sentence-transformers
+streamlit==1.41.1
+psycopg2-binary==2.9.10
+elasticsearch[async]==8.17.0
+requests==2.32.3
+python-dotenv==1.0.1
+pydantic==2.10.3

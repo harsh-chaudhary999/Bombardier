@@ -1,0 +1,376 @@
+"""
+Phase 5: Write-back approved decisions to Xray/Jira.
+
+After human review (Phase 4), approved decisions are synced back:
+  KEEP      → mark written_back (no Xray action)
+  UPDATE    → update test steps/summary via xray_client
+  DEPRECATE → add DEPRECATED label + comment via xray_client
+  CREATE    → bulk-create new tests via xray_client
+  QUESTION  → mark written_back (no Xray action)
+"""
+import json
+import logging
+import os
+import time
+from typing import Any
+from urllib.parse import quote
+
+from integrations import xray_client
+from embeddings.pg_store import PGStore
+
+logger = logging.getLogger(__name__)
+
+
+def _steps_from_free_text(text: Any) -> list[dict] | None:
+    """Convert free-text step outline into a single manual step payload."""
+    if text is None:
+        return None
+    s = text.strip() if isinstance(text, str) else str(text).strip()
+    if not s:
+        return None
+    return [{"action": "other", "data": s, "expectedResult": ""}]
+
+
+def _resolve_prd_remote_url(prd_source: str, es_store: Any) -> str | None:
+    """
+    URL for Jira remote links — prefer indexed doc_url; otherwise build from env + source id.
+
+    Stored prd_source values are typically type:id (e.g. confluence:12345), not HTTP URLs.
+    """
+    if not prd_source:
+        return None
+    ps = prd_source.strip()
+    if ps.startswith(("http://", "https://")):
+        return ps
+
+    if es_store is not None:
+        try:
+            r = es_store._client.search(
+                index="qa_prd_chunks",
+                query={"term": {"source_id": ps}},
+                source=["doc_url"],
+                size=1,
+            )
+            hits = r["hits"]["hits"]
+            if hits:
+                u = (hits[0].get("_source") or {}).get("doc_url")
+                if u:
+                    return str(u)
+        except Exception as ex:
+            logger.warning("Could not resolve doc_url from ES for %s: %s", prd_source, ex)
+
+    domain = (os.environ.get("CONFLUENCE_DOMAIN") or "").strip().strip("/")
+    if ps.startswith("confluence:") and domain:
+        page_id = ps.split(":", 1)[1].strip()
+        if page_id.isdigit():
+            return f"https://{domain}/wiki/pages/viewpage.action?pageId={page_id}"
+
+    raw_host = (os.environ.get("GITLAB_HOST") or "").strip().rstrip("/")
+    if raw_host.startswith(("http://", "https://")):
+        host = raw_host.split("://", 1)[1].split("/", 1)[0]
+        scheme = "https" if raw_host.startswith("https") else "http"
+    elif raw_host:
+        host = raw_host.split("/", 1)[0]
+        scheme = "https"
+    else:
+        host = ""
+        scheme = "https"
+
+    proj = (os.environ.get("GITLAB_PROJECT_ID") or "").strip().strip("/")
+    if ps.startswith("gitlab_file:") and host and proj:
+        path = ps.split(":", 1)[1].strip().lstrip("/")
+        enc = quote(path, safe="/")
+        ref = os.environ.get("GITLAB_DEFAULT_REF", "main")
+        return f"{scheme}://{host}/{proj}/-/blob/{ref}/{enc}"
+
+    if ps.startswith("gitlab:") and host and proj:
+        path = ps.split(":", 1)[1].strip().lstrip("/")
+        enc = quote(path, safe="/")
+        ref = os.environ.get("GITLAB_DEFAULT_REF", "main")
+        return f"{scheme}://{host}/{proj}/-/blob/{ref}/{enc}"
+
+    logger.info("No remote URL resolved for prd_source=%r (set ES chunks or CONFLUENCE_DOMAIN / GITLAB_*)", ps)
+    return None
+
+
+async def run_writeback(
+    pg_store: PGStore,
+    run_id: str | None = None,
+    project_key: str = "",
+    dry_run: bool = False,
+    es_store: Any | None = None,
+) -> dict[str, Any]:
+    """
+    Write back all approved, not-yet-written-back decisions to Xray.
+
+    If run_id is provided, only writes back decisions for that run.
+    Otherwise (when QA_WRITEBACK_ALLOW_GLOBAL=1), processes all approved pending write-backs.
+
+    Streams decisions in SQL batches — does not load the full decision set into memory.
+
+    Returns a summary dict with counts per action and any errors.
+    """
+    started = time.time()
+
+    allow_global = os.environ.get("QA_WRITEBACK_ALLOW_GLOBAL", "") == "1"
+    if run_id is None and not allow_global:
+        return {
+            "status": "error",
+            "message": (
+                "run_id is required for write-back. "
+                "Set QA_WRITEBACK_ALLOW_GLOBAL=1 only if you intend to process every approved decision."
+            ),
+            "total": 0,
+            "written_back": {},
+            "errors": [
+                {
+                    "error": (
+                        "run_id required — refusing unbounded global write-back "
+                        "(set QA_WRITEBACK_ALLOW_GLOBAL=1 to override)"
+                    ),
+                }
+            ],
+        }
+
+    def _peek_nonempty() -> bool:
+        for b in pg_store.iter_writeback_decisions(run_id, batch_size=200):
+            return len(b) > 0
+        return False
+
+    if not _peek_nonempty():
+        return {
+            "status": "completed",
+            "message": "No approved decisions pending write-back",
+            "total": 0,
+            "written_back": {},
+            "errors": [],
+        }
+
+    if dry_run:
+        by_action: dict[str, int] = {}
+        dry_sample: list[dict] = []
+        total = 0
+        for batch in pg_store.iter_writeback_decisions(run_id, batch_size=200):
+            for d in batch:
+                total += 1
+                a = d.get("action") or "?"
+                by_action[a] = by_action.get(a, 0) + 1
+                if len(dry_sample) < 500:
+                    dry_sample.append({
+                        "id": d.get("id"),
+                        "action": d.get("action"),
+                        "jira_key": d.get("jira_key"),
+                        "prd_section": (d.get("prd_section") or "")[:120],
+                    })
+        return {
+            "status": "dry_run",
+            "message": "No Xray/Jira calls made — preview only",
+            "total": total,
+            "by_action": by_action,
+            "decisions": dry_sample,
+            "elapsed_s": round(time.time() - started, 1),
+            "errors": [],
+        }
+
+    logger.info(
+        "Writing back approved decisions (streamed)"
+        + (f" for run {run_id}" if run_id else " (global)")
+    )
+
+    counts: dict[str, int] = {"keep": 0, "update": 0, "deprecate": 0, "create": 0, "question": 0}
+    errors: list[dict] = []
+    create_queue: list[tuple[int, dict, str]] = []
+
+    processed = 0
+    for batch in pg_store.iter_writeback_decisions(run_id, batch_size=200):
+        for decision in batch:
+            processed += 1
+            action = decision["action"]
+            decision_id = decision["id"]
+            jira_key = decision.get("jira_key")
+            reason = decision.get("reason", "")
+            content = decision.get("updated_content") or {}
+            if isinstance(content, str):
+                try:
+                    content = json.loads(content)
+                except Exception:
+                    content = {}
+
+            try:
+                if action in ("keep", "question"):
+                    pg_store.mark_written_back(decision_id)
+                    counts[action] = counts.get(action, 0) + 1
+
+                elif action == "update":
+                    if not jira_key:
+                        errors.append({"decision_id": decision_id, "error": "UPDATE decision missing jira_key"})
+                        continue
+                    summary = content.get("summary")
+                    steps = content.get("steps")
+                    suggested = content.get("suggested_changes")
+                    if suggested and not steps:
+                        steps = _steps_from_free_text(suggested)
+                    if summary or steps:
+                        await xray_client.update_test(jira_key, summary=summary, steps=steps)
+                    elif suggested:
+                        logger.warning(
+                            f"  UPDATE {jira_key}: suggested_changes empty after trim — skipping Xray update"
+                        )
+                        errors.append({
+                            "decision_id": decision_id,
+                            "jira_key": jira_key,
+                            "action": "update",
+                            "error": "suggested_changes provided but empty after trim",
+                        })
+                        continue
+                    else:
+                        errors.append({
+                            "decision_id": decision_id,
+                            "jira_key": jira_key,
+                            "action": "update",
+                            "error": "UPDATE decision missing suggested_changes/steps/summary payload",
+                        })
+                        continue
+                    pg_store.mark_written_back(decision_id)
+                    counts["update"] += 1
+                    logger.info(f"  Updated {jira_key}")
+
+                elif action == "deprecate":
+                    if not jira_key:
+                        errors.append({"decision_id": decision_id, "error": "DEPRECATE decision missing jira_key"})
+                        continue
+                    await xray_client.deprecate_test(jira_key, reason)
+                    pg_store.mark_written_back(decision_id)
+                    counts["deprecate"] += 1
+                    logger.info(f"  Deprecated {jira_key}")
+
+                elif action == "create":
+                    if content.get("created_jira_key"):
+                        pg_store.mark_written_back(decision_id)
+                        counts["create"] += 1
+                        logger.info(
+                            "  CREATE decision %s already has created_jira_key=%s — marking written_back",
+                            decision_id,
+                            content.get("created_jira_key"),
+                        )
+                        continue
+                    new_test = {
+                        "summary": content.get("summary", "New test case"),
+                        "testType": "Manual",
+                    }
+                    if content.get("suggested_steps"):
+                        steps = _steps_from_free_text(content["suggested_steps"])
+                        if steps:
+                            new_test["steps"] = steps
+                        else:
+                            errors.append({
+                                "decision_id": decision_id,
+                                "action": "create",
+                                "error": "CREATE decision has empty suggested_steps",
+                            })
+                            continue
+                    prd_src = decision.get("prd_source") or ""
+                    create_queue.append((decision_id, new_test, prd_src))
+
+                else:
+                    errors.append({"decision_id": decision_id, "error": f"Unknown action: {action}"})
+
+            except Exception as e:
+                logger.warning(f"  Write-back failed for decision {decision_id} ({action} {jira_key}): {e}")
+                errors.append({
+                    "decision_id": decision_id,
+                    "jira_key": jira_key,
+                    "action": action,
+                    "error": str(e),
+                })
+
+    logger.info("Processed %s write-back decision rows from DB batches", processed)
+
+    # Batch create new tests (up to 50 at a time)
+    if create_queue and project_key:
+        BATCH = 50
+        for i in range(0, len(create_queue), BATCH):
+            batch = create_queue[i:i + BATCH]
+            tests = [t for _, t, _ in batch]
+            ids = [did for did, _, _ in batch]
+            try:
+                result = await xray_client.bulk_create_tests(project_key, tests)
+                created_keys: list[str] = []
+                if isinstance(result, dict):
+                    created_keys = result.get("keys") or result.get("createdKeys") or []
+                elif isinstance(result, list):
+                    created_keys = [r.get("key") for r in result if isinstance(r, dict) and r.get("key")]
+
+                for j, (did, _, prd_source) in enumerate(batch):
+                    key = created_keys[j] if j < len(created_keys) else None
+                    if key is None:
+                        errors.append({
+                            "decision_id": did,
+                            "action": "create",
+                            "error": "Xray did not return a key for this test in the bulk response",
+                        })
+                        continue
+                    if key:
+                        merged = pg_store.merge_decision_updated_content(
+                            did, {"created_jira_key": key}
+                        )
+                        if not merged:
+                            logger.error(
+                                "Could not persist created_jira_key for decision %s — retry may duplicate",
+                                did,
+                            )
+                    ok = pg_store.mark_written_back(did)
+                    if not ok:
+                        logger.error(
+                            "mark_written_back failed for decision %s after successful Xray create",
+                            did,
+                        )
+                    counts["create"] += 1
+                    if key and prd_source:
+                        link_url = _resolve_prd_remote_url(prd_source, es_store)
+                        if link_url:
+                            try:
+                                await xray_client.add_remote_link(
+                                    key,
+                                    url=link_url,
+                                    title=f"PRD: {prd_source}",
+                                )
+                            except Exception as link_err:
+                                logger.warning(
+                                    "  Remote link failed for %s → %s: %s",
+                                    key,
+                                    prd_source,
+                                    link_err,
+                                )
+                        else:
+                            logger.warning(
+                                "  Skipping remote link for %s — could not resolve URL for %s",
+                                key,
+                                prd_source,
+                            )
+
+                logger.info(f"  Created {len(batch)} new tests (batch {i // BATCH + 1})")
+            except Exception as e:
+                logger.warning(f"  Bulk create failed for batch {i // BATCH + 1}: {e}")
+                for did in ids:
+                    errors.append({"decision_id": did, "action": "create", "error": str(e)})
+    elif create_queue and not project_key:
+        for did, _, _ in create_queue:
+            errors.append({
+                "decision_id": did,
+                "action": "create",
+                "error": "project_key required for CREATE actions",
+            })
+
+    elapsed = round(time.time() - started, 1)
+    total_written = sum(counts.values())
+
+    logger.info(f"Write-back complete: {total_written} written, {len(errors)} errors, {elapsed}s")
+
+    return {
+        "status": "completed" if not errors else "completed_with_errors",
+        "total": total_written,
+        "written_back": counts,
+        "errors": errors,
+        "elapsed_s": elapsed,
+    }

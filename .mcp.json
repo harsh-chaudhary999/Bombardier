@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "gitlab": {
+      "type": "http",
+      "url": "http://127.0.0.1:3101/mcp"
+    },
+    "xray": {
+      "type": "http",
+      "url": "http://127.0.0.1:3100/mcp"
+    }
+  }
+}
