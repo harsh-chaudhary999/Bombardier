@@ -42,15 +42,18 @@ from embeddings.es_store import ESStore
 from embeddings.pg_store import PGStore
 from sync.test_sync import run_sync
 from ingestion.prd_pipeline import run_ingest, run_file_ingest
+from agents import capacity
 from agents.analysis_agent import run_analysis, build_preview, validate_prd_data
 from agents.writeback import run_writeback
 from agents.incremental import run_incremental_analysis
 from embeddings.rank_filter import relative_cut, separation
 from embeddings.reranker import Reranker
 from integrations import webhook
+from observability import phase_ledger
 from observability.phase_ledger import verify_ledger_writable
 from observability.request_norm import (
     GAP_RISKS,
+    auto_approve_reason,
     merge_section_coverage,
     normalize_module_list,
     unknown_module_error,
@@ -207,6 +210,40 @@ def _reviewer_from_request(request: Request) -> str | None:
 
 # ─── Background task helper ───────────────────────────────────────────────────
 
+# ─── Backpressure ─────────────────────────────────────────────────────────────
+# Capacity logic lives in agents/capacity.py; this layer only turns AtCapacity into
+# an HTTP response.
+_analysis_capacity = capacity.from_env()
+MAX_CONCURRENT_ANALYSES = _analysis_capacity.limit
+
+
+def _analysis_slots_free() -> int:
+    return _analysis_capacity.free()
+
+
+def _claim_analysis_slot() -> None:
+    """Reserve a slot in the request handler, or refuse the request with 429."""
+    try:
+        _analysis_capacity.claim()
+    except capacity.AtCapacity as exc:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "too_many_concurrent_analyses",
+                "running": exc.running,
+                "limit": exc.limit,
+                "message": "Analysis capacity is full. Retry shortly, or raise "
+                           "QA_MAX_CONCURRENT_ANALYSES if the host can take it.",
+            },
+            headers={"Retry-After": "60"},
+        ) from exc
+
+
+def _with_analysis_slot(coro):
+    """Release the slot however the run ends — success, failure or cancellation."""
+    return _analysis_capacity.run(coro)
+
+
 def _track_task(run_id: str, coro) -> asyncio.Task:
     """Create a tracked background task that logs exceptions instead of swallowing them."""
     existing = _background_tasks.get(run_id)
@@ -292,6 +329,8 @@ async def lifespan(app: FastAPI):
     logger.info("Elasticsearch ready.")
 
     app.state.pg_store = PGStore()
+    # The ledger writes to Postgres from here on; before this, to the JSONL file.
+    phase_ledger.set_store(app.state.pg_store)
     logger.info("Postgres relational store ready.")
 
     n_orphan = app.state.pg_store.fail_orphaned_running_runs(
@@ -1349,9 +1388,10 @@ async def analyse_prd(request: Request, req: AnalysePRDRequest):
         run_id = deterministic_analysis_run_id(req.prd_source_id, module_n)
     else:
         run_id = str(uuid.uuid4())
+    _claim_analysis_slot()
     _track_task(
         run_id,
-        run_analysis(
+        _with_analysis_slot(run_analysis(
             prd_source_id=req.prd_source_id,
             module=module_n,
             embed_client=app.state.embed_client,
@@ -1362,7 +1402,7 @@ async def analyse_prd(request: Request, req: AnalysePRDRequest):
             provider=req.provider,
             model=req.model,
             reranker=getattr(app.state, "reranker", None),
-        ),
+        )),
     )
 
     out = {
@@ -1745,9 +1785,24 @@ async def confluence_webhook(request: Request):
         "analysis": "not_started",
     }
 
+    # Capacity is checked, not claimed-or-refused: a 429 to Confluence is a delivery
+    # failure it will retry, and retrying an analysis we deliberately skipped is worse
+    # than skipping it. The re-ingest above has already happened, so the index is fresh
+    # either way and the next edit will trigger analysis again.
+    wants_analysis = (previous and WEBHOOK_ANALYZE) or (not previous and WEBHOOK_ANALYZE_NEW)
+    if wants_analysis and _analysis_slots_free() == 0:
+        result["analysis"] = "skipped_at_capacity"
+        logger.warning(
+            "Confluence webhook: %s re-ingested but analysis skipped — %s/%s analyses "
+            "already running", prd_source_id, _analysis_capacity.in_flight,
+            MAX_CONCURRENT_ANALYSES,
+        )
+        return result
+
     if previous and WEBHOOK_ANALYZE:
         analysis_run_id = str(uuid.uuid4())
-        _track_task(analysis_run_id, run_incremental_analysis(
+        _claim_analysis_slot()
+        _track_task(analysis_run_id, _with_analysis_slot(run_incremental_analysis(
             prd_source_id=prd_source_id,
             previous_run_id=previous["run_id"],
             module=None,
@@ -1758,12 +1813,13 @@ async def confluence_webhook(request: Request):
             provider=_env_default_provider(),
             model=_env_default_model(),
             reranker=getattr(app.state, "reranker", None),
-        ))
+        )))
         result["analysis_run_id"] = analysis_run_id
         result["analysis"] = "incremental"
     elif not previous and WEBHOOK_ANALYZE_NEW:
         analysis_run_id = str(uuid.uuid4())
-        _track_task(analysis_run_id, run_analysis(
+        _claim_analysis_slot()
+        _track_task(analysis_run_id, _with_analysis_slot(run_analysis(
             prd_source_id=prd_source_id,
             module=None,
             embed_client=app.state.embed_client,
@@ -1773,7 +1829,7 @@ async def confluence_webhook(request: Request):
             provider=_env_default_provider(),
             model=_env_default_model(),
             reranker=getattr(app.state, "reranker", None),
-        ))
+        )))
         result["analysis_run_id"] = analysis_run_id
         result["analysis"] = "full"
     elif not previous:
@@ -1786,6 +1842,192 @@ async def confluence_webhook(request: Request):
         event, prd_source_id, ingest_run_id, result["analysis"],
     )
     return result
+
+
+class AutoApproveRequest(BaseModel):
+    run_id: str
+    threshold: float = Field(default=0.95, ge=0.80, le=1.0)
+    min_samples: int = Field(default=20, ge=5)
+    # Defaults to a preview. Auto-approval writes review state that write-back then
+    # acts on, so the caller should see what it would do before it does it.
+    dry_run: bool = True
+
+
+@app.post("/review/auto-approve", status_code=200)
+@limiter.limit("10/minute")
+async def auto_approve(request: Request, req: AutoApproveRequest):
+    """
+    Approve the decisions a human would almost certainly have approved anyway.
+
+    Four gates, all required:
+      * the action is KEEP or UPDATE — DEPRECATE and CREATE always need a person
+      * the agent recorded confidence "high"
+      * humans have historically approved that action at or above `threshold`
+      * that history is at least `min_samples` reviewed decisions
+
+    This clears the KEEP backlog that dominates review queues. It is not a way to
+    review faster in general: the two actions that change or remove a test are
+    excluded by rule, not by threshold.
+
+    dry_run defaults to true. The response explains, per decision, why each one was
+    skipped — so a run that approves nothing tells you which gate is closed.
+    """
+    pg: PGStore = app.state.pg_store
+    loop = asyncio.get_running_loop()
+
+    decisions = await loop.run_in_executor(
+        None, lambda: pg.get_pending_decisions(run_id=req.run_id))
+    pending = [d for d in decisions if not d.get("reviewed")]
+    if not pending:
+        return {"dry_run": req.dry_run, "run_id": req.run_id, "considered": 0,
+                "approved": 0, "skipped": 0, "decisions": [],
+                "note": "No unreviewed decisions in this run."}
+
+    # One rate lookup per action, not per decision.
+    rates: dict[str, tuple[float, int]] = {}
+    for action in {d.get("action") for d in pending if d.get("action")}:
+        rates[action] = await loop.run_in_executor(
+            None, lambda a=action: pg.get_approval_rate(a, min_samples=req.min_samples))
+
+    approved, skipped = [], []
+    for d in pending:
+        action = d.get("action") or ""
+        rate, samples = rates.get(action, (0.0, 0))
+        blocked = auto_approve_reason(
+            action=action, confidence=d.get("confidence"),
+            approval_rate=rate, samples=samples,
+            threshold=req.threshold, min_samples=req.min_samples,
+        )
+        if blocked:
+            skipped.append({"id": d["id"], "action": action, "reason": blocked})
+            continue
+        entry = {"id": d["id"], "action": action, "jira_key": d.get("jira_key"),
+                 "approval_rate": round(rate, 3), "samples": samples}
+        if not req.dry_run:
+            await loop.run_in_executor(None, lambda did=d["id"], a=action, r=rate, n=samples: (
+                pg.approve_decision(
+                    did, approved=True,
+                    reviewer_note=(f"Auto-approved: {r:.0%} of {n} reviewed {a} decisions "
+                                   f"were approved, and the agent reported high confidence."),
+                    reviewed_by="qa-engine-auto-approver",
+                )
+            ))
+        approved.append(entry)
+
+    logger.info(
+        "Auto-approve%s on run %s: %s approved, %s skipped",
+        " (dry run)" if req.dry_run else "", req.run_id, len(approved), len(skipped),
+    )
+    return {
+        "dry_run": req.dry_run,
+        "run_id": req.run_id,
+        "considered": len(pending),
+        "approved": len(approved),
+        "skipped": len(skipped),
+        "decisions": approved,
+        "skipped_detail": skipped[:100],
+    }
+
+
+class ArchiveRequest(BaseModel):
+    retention_days: int = Field(default=180, ge=30, le=3650)
+    batch_size: int = Field(default=1000, ge=100, le=10000)
+    dry_run: bool = True
+
+
+@app.post("/admin/archive-decisions", status_code=200)
+@limiter.limit("5/minute")
+async def archive_decisions(request: Request, req: ArchiveRequest):
+    """
+    Move written-back decisions older than `retention_days` into the archive table.
+
+    Only written-back rows move. Anything still awaiting review or write-back stays,
+    however old — archiving it would hide exactly what GET /decisions/overdue exists to
+    surface.
+
+    Idempotent and batched: run it repeatedly until `archived` comes back 0.
+    """
+    pg: PGStore = app.state.pg_store
+    if req.dry_run:
+        return {
+            "dry_run": True,
+            "retention_days": req.retention_days,
+            "note": "Set dry_run=false to move rows. Only written_back rows are eligible; "
+                    "run repeatedly until archived is 0.",
+        }
+    loop = asyncio.get_running_loop()
+    moved = await loop.run_in_executor(
+        None, lambda: pg.archive_old_decisions(req.retention_days, req.batch_size))
+    return {"dry_run": False, "archived": moved, "retention_days": req.retention_days,
+            "more_remaining": moved == req.batch_size}
+
+
+@app.get("/tests/{jira_key}/history")
+@limiter.limit("60/minute")
+def test_history(request: Request, jira_key: str,
+                 limit: int = Query(default=50, ge=1, le=200)):
+    """
+    Every change this engine has written back to a test, newest first.
+
+    Answers "why does this test look like this?" months later. Distinct from the
+    decisions log: this records what was actually *written*, which is a smaller set —
+    decisions get rejected, and write-backs can fail.
+
+    An empty history means the engine has never changed this test, not that the test
+    is unknown to it.
+    """
+    import re as _re
+    if not _re.fullmatch(r"[A-Z][A-Z0-9_]*-\d+", jira_key):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Not a Jira key: {jira_key!r} (expected e.g. PROJ-1234)",
+        )
+    pg: PGStore = app.state.pg_store
+    history = pg.get_test_ancestry(jira_key, limit=limit)
+    return {"jira_key": jira_key, "changes": len(history), "history": history}
+
+
+@app.get("/analyze/orphan-tests")
+@limiter.limit("5/minute")
+async def analyze_orphan_tests(
+    request: Request,
+    module: list[str] = Query(default=[]),
+    threshold: float = Query(default=0.70, ge=0.5, le=0.95),
+    max_tests: int = Query(default=200, ge=10, le=1000),
+):
+    """
+    Tests that no indexed document appears to describe.
+
+    Deprecation *candidates*, not conclusions. A test shows up here for two very
+    different reasons: the feature is genuinely gone, or its PRD was never ingested.
+    Check `scanned` and the corpus before reading anything into the list — on a
+    half-ingested corpus most tests are "orphans" and the result means nothing.
+
+    Expensive (one vector query per test) and rate-limited. Intended for a periodic
+    review, not a dashboard refresh.
+    """
+    es: ESStore = app.state.es_store
+    module_n = normalize_module_list(module or None)
+    _require_known_modules(module_n, es)
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(
+        None,
+        lambda: es.find_orphan_tests(
+            module_filter=module_n, threshold=threshold, max_tests=max_tests),
+    )
+
+    return {
+        "threshold": threshold,
+        "module_filter": module_n,
+        "scanned": result["scanned"],
+        "orphan_count": len(result["orphans"]),
+        "skipped_no_vector": result["skipped_no_vector"],
+        "truncated": result["truncated"],
+        "orphans": result["orphans"],
+        "hint": "Low best_score means nothing in the indexed corpus resembles the test. "
+                "Confirm the relevant PRDs are ingested before treating these as dead.",
+    }
 
 
 @app.get("/decisions/overdue")
@@ -1999,6 +2241,12 @@ async def rollback_writeback(request: Request, decision_id: int, req: RollbackRe
     pg.merge_decision_updated_content(decision_id, {
         "rolled_back_at": datetime.now(timezone.utc).isoformat(),
     })
+    pg.record_ancestry(
+        jira_key=jira_key, run_id=str(row.get("run_id") or ""),
+        change_type="rolled_back", prd_source=row.get("prd_source"),
+        reason_summary="Deprecation rolled back; labels restored from snapshot.",
+        decision_id=decision_id,
+    )
     logger.info("Rolled back deprecation of %s (decision %s)", jira_key, decision_id)
     return {
         "dry_run": False,
@@ -2064,9 +2312,10 @@ async def analyse_incremental(request: Request, req: IncrementalAnalysisRequest)
     )
 
     run_id = str(uuid.uuid4())
+    _claim_analysis_slot()
     _track_task(
         run_id,
-        run_incremental_analysis(
+        _with_analysis_slot(run_incremental_analysis(
             prd_source_id=req.prd_source_id,
             previous_run_id=req.previous_run_id,
             module=module_n,
@@ -2077,7 +2326,7 @@ async def analyse_incremental(request: Request, req: IncrementalAnalysisRequest)
             provider=req.provider,
             model=req.model,
             reranker=getattr(app.state, "reranker", None),
-        ),
+        )),
     )
 
     out = {

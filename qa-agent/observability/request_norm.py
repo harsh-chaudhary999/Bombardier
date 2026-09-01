@@ -93,6 +93,44 @@ def section_gap_risk(counts: dict | None) -> str:
     return "uncovered"
 
 
+#: Actions that may never be auto-approved regardless of history. DEPRECATE deletes
+#: coverage and CREATE adds a test nobody wrote; both deserve a human, and neither is
+#: what auto-approval is for — it exists to clear the KEEP backlog that dominates review.
+NEVER_AUTO_APPROVE = frozenset({"deprecate", "create"})
+
+
+def auto_approve_reason(
+    action: str,
+    confidence: str | None,
+    approval_rate: float,
+    samples: int,
+    threshold: float,
+    min_samples: int,
+) -> str | None:
+    """
+    Why this decision may NOT be auto-approved, or None if it may.
+
+    Returning the reason rather than a bool is deliberate: a caller running in dry-run
+    wants to know why each decision was skipped, and "false" cannot be reported.
+
+    Four independent gates, each of which alone is insufficient:
+      * the action is reversible and low-stakes
+      * the agent itself said "high"
+      * humans have historically approved this action at or above the threshold
+      * that history is large enough to mean anything
+    """
+    if action in NEVER_AUTO_APPROVE:
+        return f"{action} always needs a human"
+    if confidence != "high":
+        return f"agent confidence is {confidence or 'unset'}, not high"
+    if samples < min_samples:
+        return f"only {samples} reviewed {action} decisions in history (need {min_samples})"
+    if approval_rate < threshold:
+        return (f"historical approval rate for {action} is {approval_rate:.0%} "
+                f"(need {threshold:.0%})")
+    return None
+
+
 _COVERAGE_COUNT_FIELDS = (
     "decisions", "keep_count", "update_count", "deprecate_count", "create_count",
     "question_count", "high_confidence", "low_confidence", "unrated",

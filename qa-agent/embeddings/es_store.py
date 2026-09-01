@@ -285,6 +285,87 @@ class ESStore:
     def ping(self) -> bool:
         return self._client.ping()
 
+    def find_orphan_tests(
+        self,
+        module_filter: list[str] | None = None,
+        threshold: float = 0.70,
+        max_tests: int = 300,
+        batch_size: int = 50,
+    ) -> dict:
+        """
+        Tests whose best match in the whole PRD corpus scores below `threshold`.
+
+        These are deprecation *candidates*: nothing in any indexed document describes
+        what they test. Candidates, not conclusions — a test can be orphaned because
+        its PRD was never ingested, which says nothing about the test.
+
+        Expensive: one KNN query per test, so it is capped and meant for a periodic
+        review rather than a request path. Returns the orphans plus what was actually
+        scanned, because "12 orphans" means nothing without "out of how many".
+        """
+        query: dict = {"match_all": {}}
+        scope = _module_scope_clause(module_filter)
+        if scope is not None:
+            query = scope
+
+        orphans: list[dict] = []
+        scanned = 0
+        skipped_no_vector = 0
+        truncated = False
+
+        for hit in helpers.scan(
+            self._client,
+            index=INDEX_TEST_CASES,
+            query={"query": query,
+                   "_source": ["jira_key", "summary", "module", "folder_path", "embedding"]},
+            scroll="5m",
+            size=batch_size,
+        ):
+            if scanned >= max_tests:
+                truncated = True
+                break
+            src = hit["_source"]
+            vector = src.get("embedding")
+            if not vector:
+                skipped_no_vector += 1
+                continue
+            scanned += 1
+
+            resp = self._client.search(
+                index=INDEX_PRD_CHUNKS,
+                knn={"field": "embedding", "query_vector": vector,
+                     "k": 1, "num_candidates": 32},
+                source=["source_id", "doc_title", "section_heading"],
+                size=1,
+            )
+            hits = resp.get("hits", {}).get("hits", [])
+            best = hits[0]["_score"] if hits else 0.0
+            if best >= threshold:
+                continue
+            nearest = hits[0]["_source"] if hits else {}
+            orphans.append({
+                "jira_key": src.get("jira_key"),
+                "summary": src.get("summary"),
+                "module": src.get("module"),
+                "folder_path": src.get("folder_path"),
+                "best_score": round(best, 4),
+                "nearest_document": nearest.get("source_id"),
+                "nearest_section": nearest.get("section_heading"),
+            })
+
+        if skipped_no_vector:
+            logger.warning(
+                "Orphan scan skipped %s test(s) with no embedding — they cannot be "
+                "compared and are neither orphans nor covered", skipped_no_vector,
+            )
+        orphans.sort(key=lambda o: o["best_score"])
+        return {
+            "orphans": orphans,
+            "scanned": scanned,
+            "skipped_no_vector": skipped_no_vector,
+            "truncated": truncated,
+        }
+
     def get_test_embedding(self, jira_key: str) -> list[float] | None:
         """
         The stored vector for one test case, or None if absent.

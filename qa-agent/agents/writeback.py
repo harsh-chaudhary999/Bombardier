@@ -316,7 +316,9 @@ async def run_writeback(
 
     counts: dict[str, int] = {"keep": 0, "update": 0, "deprecate": 0, "create": 0, "question": 0}
     errors: list[dict] = []
-    create_queue: list[tuple[int, dict, str]] = []
+    # (decision_id, payload, prd_source, reason) — the reason travels with the entry
+    # because the drain loop below runs outside the per-decision scope.
+    create_queue: list[tuple[int, dict, str, str]] = []
 
     processed = 0
     for batch in pg_store.iter_writeback_decisions(run_id, batch_size=200):
@@ -420,6 +422,11 @@ async def run_writeback(
                         applied.append("comment")
 
                     pg_store.mark_written_back(decision_id)
+                    pg_store.record_ancestry(
+                        jira_key=jira_key, run_id=run_id or "", change_type="updated",
+                        prd_source=decision.get("prd_source"), reason_summary=reason,
+                        decision_id=decision_id,
+                    )
                     counts["update"] += 1
                     logger.info("  Updated %s (%s)", jira_key, ", ".join(applied))
 
@@ -449,6 +456,11 @@ async def run_writeback(
 
                     await xray_client.deprecate_test(jira_key, reason)
                     pg_store.mark_written_back(decision_id)
+                    pg_store.record_ancestry(
+                        jira_key=jira_key, run_id=run_id or "", change_type="deprecated",
+                        prd_source=decision.get("prd_source"), reason_summary=reason,
+                        decision_id=decision_id,
+                    )
                     counts["deprecate"] += 1
                     logger.info(f"  Deprecated {jira_key}")
 
@@ -485,7 +497,7 @@ async def run_writeback(
                                 new_test["summary"],
                             )
                     prd_src = decision.get("prd_source") or ""
-                    create_queue.append((decision_id, new_test, prd_src))
+                    create_queue.append((decision_id, new_test, prd_src, reason))
 
                 else:
                     errors.append({"decision_id": decision_id, "error": f"Unknown action: {action}"})
@@ -506,8 +518,8 @@ async def run_writeback(
         BATCH = 50
         for i in range(0, len(create_queue), BATCH):
             batch = create_queue[i:i + BATCH]
-            tests = [t for _, t, _ in batch]
-            ids = [did for did, _, _ in batch]
+            tests = [t for _, t, _, _ in batch]
+            ids = [did for did, _, _, _ in batch]
             try:
                 result = await xray_client.bulk_create_tests(project_key, tests)
                 created_keys: list[str] = []
@@ -516,7 +528,7 @@ async def run_writeback(
                 elif isinstance(result, list):
                     created_keys = [r.get("key") for r in result if isinstance(r, dict) and r.get("key")]
 
-                for j, (did, _, prd_source) in enumerate(batch):
+                for j, (did, _, prd_source, create_reason) in enumerate(batch):
                     key = created_keys[j] if j < len(created_keys) else None
                     if key is None:
                         errors.append({
@@ -539,6 +551,13 @@ async def run_writeback(
                         logger.error(
                             "mark_written_back failed for decision %s after successful Xray create",
                             did,
+                        )
+                    if key:
+                        pg_store.record_ancestry(
+                            jira_key=key, run_id=run_id or "", change_type="created",
+                            prd_source=prd_source,
+                            reason_summary=create_reason,
+                            decision_id=did,
                         )
                     counts["create"] += 1
                     if key and prd_source:

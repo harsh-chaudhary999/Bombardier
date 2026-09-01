@@ -402,6 +402,177 @@ class PGStore:
         finally:
             self._put_conn(conn)
 
+    def append_ledger_entry(
+        self, phase: str, run_id: str, summary: dict, summary_sha256: str
+    ) -> bool:
+        """
+        Append one phase-ledger entry. Returns True if it was written.
+
+        Never raises: the ledger records that work happened, and losing an audit row
+        must not fail the work itself. A False return is the caller's cue to fall back
+        to the file.
+        """
+        try:
+            conn = self._get_conn()
+        except Exception as exc:
+            logger.warning("Phase ledger insert skipped (no connection): %s", exc)
+            return False
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO qa_rag.phase_ledger
+                        (phase, run_id, summary_sha256, summary)
+                    VALUES (%s, %s, %s, %s);
+                    """,
+                    (phase, str(run_id), summary_sha256, psycopg2.extras.Json(summary)),
+                )
+            conn.commit()
+            return True
+        except Exception as exc:
+            conn.rollback()
+            logger.warning("Phase ledger insert failed (%s/%s): %s", phase, run_id, exc)
+            return False
+        finally:
+            self._put_conn(conn)
+
+    def archive_old_decisions(self, retention_days: int = 180, batch_size: int = 1000) -> int:
+        """
+        Move written-back decisions older than `retention_days` into the archive table.
+
+        Only written-back rows: anything still awaiting review or write-back is live
+        work, however old. (An old unreviewed decision is the SLA report's problem, not
+        the archiver's — archiving it would hide exactly what that report exists to show.)
+
+        One statement, so the delete and the insert cannot half-happen. Batched, so a
+        first run against years of history does not take a long transaction.
+        Returns rows archived.
+        """
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    WITH due AS (
+                        SELECT id FROM qa_rag.pending_decisions
+                         WHERE written_back = TRUE
+                           AND created_at < NOW() - (%s * INTERVAL '1 day')
+                         ORDER BY created_at
+                         LIMIT %s
+                         FOR UPDATE SKIP LOCKED
+                    ), moved AS (
+                        DELETE FROM qa_rag.pending_decisions p
+                         USING due WHERE p.id = due.id
+                        RETURNING p.*
+                    )
+                    INSERT INTO qa_rag.pending_decisions_archive
+                    SELECT * FROM moved;
+                    """,
+                    (retention_days, batch_size),
+                )
+                moved = cur.rowcount
+            conn.commit()
+            if moved:
+                logger.info("Archived %s decision(s) older than %s days",
+                            moved, retention_days)
+            return max(0, moved)
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._put_conn(conn)
+
+    def get_approval_rate(
+        self, action: str, min_samples: int = 20
+    ) -> tuple[float, int]:
+        """
+        Historical (approval_rate, sample_size) for one action across reviewed decisions.
+
+        Only reviewed rows count — an unreviewed decision is not evidence either way.
+        Returns (0.0, n) when there is not enough history: the caller must not read a
+        high rate off three samples.
+        """
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) FILTER (WHERE approved IS TRUE)::float
+                             / NULLIF(COUNT(*), 0),
+                           COUNT(*)
+                      FROM qa_rag.pending_decisions
+                     WHERE action = %s AND reviewed = TRUE AND approved IS NOT NULL;
+                    """,
+                    (action,),
+                )
+                row = cur.fetchone()
+                total = int(row[1] or 0) if row else 0
+                if total < min_samples:
+                    return 0.0, total
+                return float(row[0] or 0.0), total
+        finally:
+            self._put_conn(conn)
+
+    def record_ancestry(
+        self,
+        jira_key: str,
+        run_id: str,
+        change_type: str,
+        prd_source: str | None = None,
+        reason_summary: str | None = None,
+        decision_id: int | None = None,
+    ) -> None:
+        """
+        Append one write-back to a test's history.
+
+        Never raises. This is an audit trail beside the real work: losing a history row
+        is regrettable, failing a write-back that already reached Xray because the
+        history insert failed is worse — the two would then disagree permanently.
+        """
+        try:
+            conn = self._get_conn()
+        except Exception as exc:
+            logger.warning("Ancestry not recorded for %s: %s", jira_key, exc)
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO qa_rag.test_ancestry
+                        (jira_key, run_id, prd_source, change_type, reason_summary, decision_id)
+                    VALUES (%s, %s::uuid, %s, %s, %s, %s);
+                    """,
+                    (jira_key, run_id, prd_source, change_type,
+                     (reason_summary or "")[:500] or None, decision_id),
+                )
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            logger.warning("Ancestry not recorded for %s (%s): %s",
+                           jira_key, change_type, exc)
+        finally:
+            self._put_conn(conn)
+
+    def get_test_ancestry(self, jira_key: str, limit: int = 50) -> list[dict]:
+        """One test's write-back history, newest first."""
+        conn = self._get_conn()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, run_id, prd_source, change_type, reason_summary,
+                           decision_id, changed_at
+                      FROM qa_rag.test_ancestry
+                     WHERE jira_key = %s
+                     ORDER BY changed_at DESC, id DESC
+                     LIMIT %s;
+                    """,
+                    (jira_key, limit),
+                )
+                return [dict(r) for r in cur.fetchall()]
+        finally:
+            self._put_conn(conn)
+
     def get_last_analysis_run(self, prd_source: str) -> dict | None:
         """
         The most recent finished analysis of a PRD, or None if it has never been analysed.

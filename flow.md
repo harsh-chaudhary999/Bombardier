@@ -248,6 +248,28 @@ A page that has never been analysed is only re-ingested — set `QA_WEBHOOK_ANAL
 to run a full analysis for those too, bearing in mind that is a full agent run per newly
 edited page.
 
+### Housekeeping
+
+```bash
+# Which tests does no document describe? (deprecation candidates, expensive, rate-limited)
+curl 'http://localhost:8000/analyze/orphan-tests?threshold=0.70&max_tests=200' \
+  | jq '{scanned, orphan_count, orphans: .orphans[:5]}'
+
+# Everything this engine has written back to one test
+curl http://localhost:8000/tests/PROJ-1234/history | jq
+
+# Approve the decisions a human would have approved anyway (KEEP/UPDATE only)
+curl -X POST http://localhost:8000/review/auto-approve -H 'Content-Type: application/json' \
+  -d '{"run_id":"<uuid>","dry_run":true}' | jq '{approved, skipped, skipped_detail: .skipped_detail[:3]}'
+
+# Move old written-back decisions to the archive; repeat until archived is 0
+curl -X POST http://localhost:8000/admin/archive-decisions -H 'Content-Type: application/json' \
+  -d '{"retention_days":180,"dry_run":false}'
+```
+
+Orphan counts mean nothing on a half-ingested corpus — check `scanned` and confirm the
+relevant PRDs are indexed before treating anything as dead.
+
 ### Is anything sitting unreviewed?
 
 ```bash
@@ -392,7 +414,8 @@ docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
   < init-db/03-sync-runs-status.sql     # adds the completed_empty run status
 
 # Migrations added by Plan A' and Plan C — apply these to any existing database:
-for f in 07-sync-runs-prd-source-index 08-decision-confidence 09-review-deadline; do
+for f in 07-sync-runs-prd-source-index 08-decision-confidence 09-review-deadline \
+         10-test-ancestry 11-decisions-archive 12-phase-ledger; do
   docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
     < "init-db/${f}.sql" && echo "applied $f"
 done
