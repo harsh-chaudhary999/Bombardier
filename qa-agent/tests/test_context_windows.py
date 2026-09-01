@@ -105,9 +105,10 @@ def _install_scan(chunks):
     elasticsearch.helpers.scan = lambda client, **kw: ({"_source": c} for c in chunks)
 
 
-def _chunk(idx, heading, text):
+def _chunk(idx, heading, text, chunk_type=None):
     return {"chunk_index": idx, "section_heading": heading,
-            "chunk_text": text, "doc_title": "Checkout PRD"}
+            "chunk_text": text, "doc_title": "Checkout PRD",
+            "chunk_type": chunk_type}
 
 
 class PrdReadBudgetTests(unittest.TestCase):
@@ -184,6 +185,67 @@ class PrdReadBudgetTests(unittest.TestCase):
         chunks = [_chunk(0, "Login", "body")]
         out = self._tools(chunks, 0)["read_prd_document"].invoke({})
         self.assertIn("body", out)
+
+
+class SplitTableReassemblyTests(PrdReadBudgetTests):
+    """
+    A table spanning several chunks repeats its header in each one so the chunk
+    stands alone in retrieval. Re-joined into one document that header is
+    duplication — the model would see three short tables where the source had one.
+    """
+
+    HEAD = "| Field | Rule |\n| --- | --- |"
+
+    def _split_table(self, chunk_type="table"):
+        return [
+            _chunk(0, "Rules", f"{self.HEAD}\n| field_a | rule_a |", chunk_type),
+            _chunk(1, "", f"{self.HEAD}\n| field_b | rule_b |", chunk_type),
+            _chunk(2, "", f"{self.HEAD}\n| field_c | rule_c |", chunk_type),
+        ]
+
+    def test_header_appears_once_in_the_reassembled_document(self):
+        out = self._tools(self._split_table(), 8_000)["read_prd_document"].invoke({})
+        self.assertEqual(out.count("| Field | Rule |"), 1)
+        self.assertEqual(out.count("| --- | --- |"), 1)
+
+    def test_no_row_is_lost(self):
+        out = self._tools(self._split_table(), 8_000)["read_prd_document"].invoke({})
+        for row in ("| field_a | rule_a |", "| field_b | rule_b |", "| field_c | rule_c |"):
+            self.assertIn(row, out)
+
+    def test_rows_stay_contiguous(self):
+        out = self._tools(self._split_table(), 8_000)["read_prd_document"].invoke({})
+        rows = [l for l in out.split("\n") if l.startswith("| field_")]
+        start = out.split("\n").index(rows[0])
+        block = out.split("\n")[start:start + 3]
+        self.assertEqual(block, rows, "rows must not be separated by repeated headers")
+
+    def test_chunks_indexed_before_chunk_type_existed_are_still_deduplicated(self):
+        """chunk_type is absent on older chunks; the strip must still apply."""
+        out = self._tools(self._split_table(chunk_type=None), 8_000)[
+            "read_prd_document"].invoke({})
+        self.assertEqual(out.count("| Field | Rule |"), 1)
+
+    def test_a_genuinely_different_table_keeps_its_own_header(self):
+        chunks = [
+            _chunk(0, "Rules", f"{self.HEAD}\n| field_a | rule_a |", "table"),
+            _chunk(1, "", "| Other | Columns |\n| --- | --- |\n| x | y |", "table"),
+        ]
+        out = self._tools(chunks, 8_000)["read_prd_document"].invoke({})
+        self.assertIn("| Field | Rule |", out)
+        self.assertIn("| Other | Columns |", out)
+
+    def test_prose_chunks_are_unaffected(self):
+        chunks = [_chunk(0, "Login", "first part", "prose"),
+                  _chunk(1, "", "second part", "prose")]
+        out = self._tools(chunks, 8_000)["read_prd_document"].invoke({})
+        self.assertIn("first part", out)
+        self.assertIn("second part", out)
+
+    def test_single_section_read_also_deduplicates(self):
+        out = self._tools(self._split_table(), 8_000)["read_prd_document"].invoke(
+            {"section": "Rules"})
+        self.assertEqual(out.count("| Field | Rule |"), 1)
 
 
 if __name__ == "__main__":

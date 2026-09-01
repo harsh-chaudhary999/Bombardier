@@ -35,6 +35,10 @@ EMBEDDING_DIM = 1024
 _QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 _QUERY_CACHE_SIZE = 512
 
+# Upper bound on characters sent to the encoder for one PRD chunk. Must exceed the
+# largest chunk the chunker can emit (see format_prd_chunk).
+EMBED_MAX_CHARS = int(os.environ.get("QA_EMBED_MAX_CHARS", "8000"))
+
 
 class EmbedClient:
     """
@@ -194,13 +198,27 @@ class EmbedClient:
         """
         Format a PRD chunk before embedding.
 
-        Prefix with section heading for context.
-        Truncated to ~1000 tokens (4000 chars) to keep CPU embedding fast
-        while capturing the full content of 800-token chunks.
+        Prefix with section heading for context, then cap the length.
+
+        The cap must stay above the chunker's SEMANTIC_MAX (1200 tokens, i.e.
+        ~4800 chars, plus the heading prefix and any carried table header). The
+        previous 4000-char cap sat below it, so the tail of a large chunk was
+        dropped from the vector while Elasticsearch still indexed the full
+        chunk_text for BM25 — dense and keyword retrieval saw different
+        documents, silently. bge-m3 accepts 8192 tokens, so 8000 chars is well
+        within model limits; lower QA_EMBED_MAX_CHARS to trade recall for CPU.
         """
-        MAX_CHARS = 4000
         if section_heading:
             text = f"Section: {section_heading}\n\n{chunk_text}"
         else:
             text = chunk_text
-        return text[:MAX_CHARS]
+
+        if len(text) > EMBED_MAX_CHARS:
+            logger.warning(
+                "PRD chunk truncated for embedding: %s chars -> %s (section=%r). "
+                "BM25 still indexes the full text; raise QA_EMBED_MAX_CHARS or lower "
+                "the chunker's SEMANTIC_MAX to keep them aligned.",
+                len(text), EMBED_MAX_CHARS, section_heading,
+            )
+            return text[:EMBED_MAX_CHARS]
+        return text

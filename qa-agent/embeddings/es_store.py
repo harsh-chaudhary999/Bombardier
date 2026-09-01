@@ -97,6 +97,13 @@ PRD_CHUNKS_MAPPING = {
                                 "fields": {"keyword": {"type": "keyword"}}},
             "chunk_text":      {"type": "text"},
             "parent_text":     {"type": "text", "index": False},  # stored for context, not searchable
+            # table | code | mixed | prose — what kind of content the chunk holds.
+            # Set by the chunker at ingest. Lets consumers decide whether layout-aware
+            # handling is worth attempting (see read_prd_document's table-header
+            # de-duplication) without re-parsing the text. Additive: chunks indexed
+            # before this field existed simply have no value, and every consumer
+            # treats a missing value as "unknown, handle generically".
+            "chunk_type":      {"type": "keyword"},
             "chunk_index":     {"type": "integer"},
             "embedding_format_version": {"type": "keyword"},
             "ingested_at":     {"type": "date"},
@@ -684,6 +691,7 @@ class ESStore:
                     "chunk_text":      c["chunk_text"],
                     "parent_text":     c.get("parent_text"),
                     "doc_type":        c.get("doc_type"),
+                    "chunk_type":      c.get("chunk_type"),
                     "chunk_index":     c["chunk_index"],
                     "embedding":       c["embedding"],
                     "embedding_format_version": os.environ.get("EMBEDDING_FORMAT_VERSION", "v1"),
@@ -829,6 +837,7 @@ class ESStore:
                 "doc_url",
                 "section_heading",
                 "chunk_text",
+                "chunk_type",
                 "chunk_index",
                 "embedding_format_version",
             ],

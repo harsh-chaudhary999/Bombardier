@@ -15,8 +15,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin
 
 import requests
-from html2text import HTML2Text
 
+from ingestion.confluence_html import storage_to_markdown
 from ingestion.doc_classify import classify as _classify_doc
 
 logger = logging.getLogger(__name__)
@@ -44,25 +44,8 @@ def _auth() -> tuple[str, str]:
 
 
 def _html_to_text(html: str) -> str:
-    # Strip ac:parameter elements AND their content (e.g. <ac:parameter ac:name="class">wide760</ac:parameter>)
-    html = re.sub(r'<ac:parameter[^>]*>.*?</ac:parameter>', '', html, flags=re.DOTALL)
-    # Strip remaining Confluence macro tags (keep content inside ac:rich-text-body etc.)
-    html = re.sub(r'</?ac:[^>]+>', '', html)
-    # Strip width/style/class attributes that could leak tokens
-    html = re.sub(r'\s+(?:width|style|class|data-[a-z-]+)="[^"]*"', '', html)
-
-    h = HTML2Text()
-    h.ignore_links = False
-    h.ignore_images = True
-    h.ignore_tables = False
-    h.body_width = 0
-    h.unicode_snob = True
-    text = h.handle(html)
-    # Safety net: remove any remaining wide\d+ Atlassian storage tokens
-    text = re.sub(r'\bwide\d+', '', text)
-    text = re.sub(r'\bfixed(?:-table|-layout|-width|Width)\b', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    return text.strip()
+    """Same conversion as single-page ingest — see ingestion/confluence_html.py."""
+    return storage_to_markdown(html)
 
 
 # ─── Space listing (site-wide crawl) ──────────────────────────────────────────
@@ -285,8 +268,15 @@ def fetch_and_chunk_page(page_meta: dict, space_key: str = "") -> list[dict]:
     Fetch body for a single page and split into section-level chunks.
     Returns one dict per H1/H2/H3 section (via chunker.chunk_document).
     Returns empty list on failure or empty body.
+
+    Chunking here is fixed-window, not semantic: a space crawl chunks pages in
+    parallel worker threads and embeds afterwards in batches
+    (prd_pipeline._ingest_one_space), so passing embed_fn would serialise an
+    embedding call per segment per page inside every worker. The same page
+    ingested singly gets semantic chunks — deliberate, for crawl throughput.
     """
     from ingestion.chunker import chunk_document
+    from ingestion.confluence_ingestor import INGEST_ATTACHMENTS, fetch_attachment_markdown
 
     page_id = page_meta["id"]
     _, title, text = _fetch_page_body(page_id)
@@ -301,6 +291,15 @@ def fetch_and_chunk_page(page_meta: dict, space_key: str = "") -> list[dict]:
         doc_url = f"https://{domain}/wiki/pages/viewpage.action?pageId={page_id}"
 
     full_text = f"# {title}\n\n{text}"
+
+    # Honour the same flag as single-page ingest. Without this a space crawl
+    # silently skips attachments while a single-page ingest of the same page
+    # picks them up — the inconsistency is worse than the feature's absence.
+    if INGEST_ATTACHMENTS:
+        attachments = fetch_attachment_markdown(page_id)
+        if attachments:
+            full_text = f"{full_text}\n\n{attachments}"
+
     raw_chunks = chunk_document(full_text, source_id)
 
     return [
@@ -313,6 +312,7 @@ def fetch_and_chunk_page(page_meta: dict, space_key: str = "") -> list[dict]:
             "section_heading": c.get("section_heading", title),
             "chunk_text":      c["chunk_text"],
             "parent_text":     c.get("parent_text"),
+            "chunk_type":      c.get("chunk_type"),
             "doc_type":        _classify_doc(title),
             "chunk_index":     i,
         }

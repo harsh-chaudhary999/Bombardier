@@ -750,7 +750,7 @@ def _make_tools(prd_source_id: str, module: list[str] | None,
         # Group chunks under their effective heading, preserving document order. Chunks
         # after a heading inherit it, matching how the chunker emits them.
         ordered_headings: list[str] = []
-        by_heading: dict[str, list[str]] = {}
+        by_heading: dict[str, list[dict]] = {}
         cur = ""
         for s in chunks:
             h = (s.get("section_heading") or "").strip()
@@ -760,10 +760,15 @@ def _make_tools(prd_source_id: str, module: list[str] | None,
             if key not in by_heading:
                 by_heading[key] = []
                 ordered_headings.append(key)
-            by_heading[key].append(s.get("chunk_text", ""))
+            by_heading[key].append(s)
 
         def _render(heading: str) -> str:
-            body = "\n\n".join(t for t in by_heading[heading] if t)
+            from ingestion.markdown_table import join_chunk_texts
+
+            # A table spanning several chunks repeats its header in each one so the
+            # chunk stands alone in retrieval. Re-joined into one document that
+            # header is duplication that splits one table into several.
+            body = join_chunk_texts([s.get("chunk_text") or "" for s in by_heading[heading]])
             return f"### {heading}\n{body}" if heading != "(no heading)" else body
 
         # ── Single-section request ──

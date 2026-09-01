@@ -3,9 +3,12 @@ FROM python:3.12-slim
 WORKDIR /app
 
 # System deps
+# tesseract-ocr is inert unless QA_INGEST_PDF_OCR=1. Without it a scanned,
+# image-only PDF indexes as nothing; ~20 MB against a multi-GB ML image.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libpq-dev \
+    tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # Install PyTorch CPU-only first — requires PyTorch's own index URL

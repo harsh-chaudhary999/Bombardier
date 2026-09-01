@@ -1056,7 +1056,7 @@ def explain_prd_embedding(source_id: str, chunk_index: int = 0):
             {"term": {"chunk_index": chunk_index}},
         ]}},
         source=["source_id", "doc_title", "section_heading",
-                "chunk_text", "chunk_index", "embedding"],
+                "chunk_text", "chunk_type", "chunk_index", "embedding"],
         size=1,
     )
     hits = resp["hits"]["hits"]
@@ -1080,6 +1080,10 @@ def explain_prd_embedding(source_id: str, chunk_index: int = 0):
             "doc_title":       src.get("doc_title"),
             "section_heading": src.get("section_heading"),
             "chunk_text":      src.get("chunk_text"),   # full text, no truncation
+            # table | code | mixed | prose. Null on chunks indexed before the field
+            # existed. A PRD you know is table-heavy showing "prose" here means the
+            # source conversion flattened its tables.
+            "chunk_type":      src.get("chunk_type"),
         },
         "embedding_input": embedding_input,             # exactly what the model saw
         "embedding_dim":   len(vec),

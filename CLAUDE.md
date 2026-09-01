@@ -82,6 +82,10 @@ The retrieval pipeline is two-stage with RRF fusion:
 
 1. **Chunking** (`ingestion/chunker.py`): Semantic chunking using embedding-based topic boundary detection within heading-based sections. Each chunk stores `parent_text` (full section) for context enrichment. Falls back to fixed-window (800 tokens) when `embed_fn` is not provided.
 
+   Structure is load-bearing: table rows, list items and fenced code blocks are atomic segments joined with newlines (a space-join flattens a table onto one line), a table split across chunks repeats its header row in every continuation chunk, and only prose–prose boundaries are scored for topic similarity — adjacent table rows are near-identical, so scoring them produced noise and one embedding call per row.
+
+0. **Source conversion**: every ingestor normalises to markdown before chunking. Confluence storage format goes through `ingestion/confluence_html.py`, which lifts code-macro CDATA bodies, image alt text/attachment filenames, macro titles and tables out *before* the `ac:`/`ri:` tag strip and html2text (all four are invisible to html2text alone). Tabular content from every source — Confluence, Word, Excel, PDF — renders through `ingestion/markdown_table.py` so rows reach the chunker starting with `|`, which is what its table handling keys off.
+
 2. **Embedding** (`embeddings/embed_client.py`): BAAI/bge-m3 (1024 dims). Asymmetric — queries get `"Represent this sentence for searching relevant passages: "` prefix, documents don't. Query embeddings are LRU-cached (512 entries).
 
 3. **Hybrid Search** (`embeddings/es_store.py`): Elasticsearch 8.17 RRF retriever combining KNN (dense vector) + BM25 (keyword). Uses `rank_constant=60`, `num_candidates=max(100, k*10)`.
@@ -123,6 +127,13 @@ Optional:
 - `QA_DETERMINISTIC_ANALYSIS_RUN_ID` — default `1`: `/analyze/prd` uses a deterministic run UUID per PRD + module + UTC minute (disable with `0` for random IDs)
 - `QA_PHASE_LEDGER_PATH` — override path for append-only `phase-ledger.jsonl` (audit / SHA-256 attestation)
 - `QA_ANALYSIS_RUN_ID_SALT` — optional salt mixed into deterministic run IDs
+- `QA_EMBED_MAX_CHARS` — default `8000`; per-chunk character cap sent to the embedder. Must stay above the chunker's `SEMANTIC_MAX` (~4800 chars) or the tail of a large chunk is dropped from the vector while Elasticsearch still indexes the full `chunk_text` for BM25
+- `QA_INGEST_KEEP_LINK_URLS` — default `0`; set `1` to keep full URLs inline in ingested body text (anchor text is kept either way)
+- `QA_INGEST_MAX_SHEET_ROWS` — default `20000`; row cap per sheet for `.xlsx` uploads
+- `QA_INGEST_MAX_WORKBOOK_MB` — default `25`; above this an `.xlsx` is read in streaming mode (flat memory, but merged cells are no longer filled down)
+- `QA_INGEST_PDF_OCR` — default `0`; set `1` to OCR scanned PDF pages. Requires `pytesseract`, `Pillow` and the `tesseract` binary, none of which are in the image by default — without them the setting logs a warning and degrades to skipping those pages
+- `QA_CONFLUENCE_INGEST_ATTACHMENTS` — default `0`; set `1` to ingest a page's `.xlsx/.docx/.pdf/.md/.txt/.csv` attachments as extra sections of that page (`QA_CONFLUENCE_MAX_ATTACHMENT_MB`, default `10`, caps each file). Off by default because it adds a request per page plus a download per attachment
+- `QA_CONFLUENCE_INGEST_CHILDREN` — default `0`; set `1` to also ingest a page's descendants (`QA_CONFLUENCE_CHILD_DEPTH` default `1`, `QA_CONFLUENCE_MAX_CHILD_PAGES` default `50`). Each child is indexed as its **own** document with its own `source_id` and `source_version` — folding children into the parent would freeze the parent's version, so a child edit would never trigger a re-ingest
 - `XRAY_PROJECT_KEY` — enables nightly auto-sync at 20:30 UTC
 - `QA_ENGINE_API_KEY` — enables API key authentication
 - `HF_TOKEN` — HuggingFace token (build-time only, for private models)

@@ -158,6 +158,7 @@ def ingest_gitlab_folder(
                 "section_heading": c.get("section_heading", heading),
                 "chunk_text":      c["chunk_text"],
                 "parent_text":     c.get("parent_text"),
+                "chunk_type":      c.get("chunk_type"),
                 "doc_type":        _classify_doc(heading),
                 "chunk_index":     i,
             })
