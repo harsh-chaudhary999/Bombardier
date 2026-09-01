@@ -36,6 +36,7 @@ from agents.analysis_agent import (
     _build_llm,
     _finalize_usage,
     _new_usage,
+    _sanitize_prd_content,
     message_text,
 )
 from agents.model_tiers import resolve_tier
@@ -77,7 +78,9 @@ def _format_context(chunks: list[dict]) -> str:
             label += f" › {heading}"
         if kind == "test":
             label += f"  (Xray test {c.get('jira_key')})"
-        body = c.get("chunk_text") or c.get("_text") or ""
+        # Indexed content is untrusted: anyone who can edit a source document can put
+        # text here, and this block goes straight into the model's context.
+        body = _sanitize_prd_content(c.get("chunk_text") or c.get("_text") or "")
         blocks.append(f"{label}\n{body}")
     return "\n\n---\n\n".join(blocks)
 

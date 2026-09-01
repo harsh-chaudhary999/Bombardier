@@ -204,6 +204,84 @@ curl -X POST http://localhost:8000/writeback/execute -H 'Content-Type: applicati
 
 `project_key` is required for CREATE actions during write-back.
 
+### Where are the gaps?
+
+`coverage_score` is one number; this is the section-by-section picture behind it. The
+section list comes from the document, so sections the agent never reached appear here
+even though they are absent from the decisions table.
+
+```bash
+curl http://localhost:8000/analyze/coverage-map/<run_id> | jq '.summary, .sections[:5]'
+```
+
+`gap_risk` per section: `uncovered` (no decision — nobody looked), `unverified` (only
+CREATE — a gap found, nothing tests it yet), `shrinking` (only DEPRECATE), `questioned`
+(only QUESTION), `covered` (a KEEP or UPDATE).
+
+`decisions_with_unmatched_section` lists decisions whose section label matches no heading
+in the document. A non-empty list means the agent is paraphrasing section names, which
+also stops incremental carry-forward finding anything to carry.
+
+### Keeping the index fresh automatically
+
+`POST /webhooks/confluence` re-ingests a page when it changes, and runs an incremental
+analysis if that page has been analysed before.
+
+**The endpoint is disabled until a secret is set** — it triggers work that costs money,
+so it is never open by default.
+
+```bash
+# .env, then restart qa-agent
+QA_CONFLUENCE_WEBHOOK_SECRET=<same value you configure in Confluence>
+
+# Confluence: Settings -> Webhooks -> add
+#   URL:    https://<host>/webhooks/confluence
+#   Events: page_updated, page_created, page_restored
+#   Secret: the value above
+```
+
+Requests are verified with HMAC-SHA256 over the raw body (`X-Hub-Signature-256`); an
+unsigned or mis-signed request gets 401. Repeat events for the same page inside
+`QA_WEBHOOK_COOLDOWN_SEC` are acknowledged and dropped.
+
+A page that has never been analysed is only re-ingested — set `QA_WEBHOOK_ANALYZE_NEW=1`
+to run a full analysis for those too, bearing in mind that is a full agent run per newly
+edited page.
+
+### Is anything sitting unreviewed?
+
+```bash
+curl 'http://localhost:8000/decisions/overdue?days=30&limit=20' | jq '{overdue_count, by_action, oldest_age_days}'
+```
+
+`by_action` matters more than the total: a hundred overdue KEEPs is a queue nobody has
+got to, while one overdue DEPRECATE is a test that may disappear without anyone having
+agreed to it.
+
+A daily check at 09:00 UTC logs the same figure and sets the `qa_decisions_overdue`
+gauge on `/metrics/prometheus`. There is no built-in notification channel — alert on that
+gauge from whatever already scrapes the endpoint.
+
+### Undoing a deprecation
+
+DEPRECATE snapshots the test's labels before changing them, so it can be reversed.
+Only DEPRECATE is reversible, and only when a snapshot exists — decisions written back
+before snapshotting existed cannot be rolled back, because the original labels were
+never recorded.
+
+```bash
+# Preview (the default): shows current labels vs what would be restored
+curl -X POST http://localhost:8000/writeback/rollback/<decision_id> \
+  -H 'Content-Type: application/json' -d '{"dry_run":true}'
+
+# Apply
+curl -X POST http://localhost:8000/writeback/rollback/<decision_id> \
+  -H 'Content-Type: application/json' -d '{"dry_run":false}'
+```
+
+The explanatory Jira comment from the deprecation is left in place — it is a true record
+that the deprecation happened — and the rollback adds its own alongside it.
+
 ---
 
 ## 5. Debugging
@@ -312,6 +390,12 @@ the one you need by hand:
 ```bash
 docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
   < init-db/03-sync-runs-status.sql     # adds the completed_empty run status
+
+# Migrations added by Plan A' and Plan C — apply these to any existing database:
+for f in 07-sync-runs-prd-source-index 08-decision-confidence 09-review-deadline; do
+  docker compose exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+    < "init-db/${f}.sql" && echo "applied $f"
+done
 ```
 
 ### Enabling optional ingestion features

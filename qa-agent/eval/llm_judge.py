@@ -118,25 +118,36 @@ async def evaluate_decisions(
                 "error": str(e),
             })
 
-    # Compute averages — only rows with numeric judge scores (not parse/infrastructure failures).
-    valid_scores = [s for s in scores if isinstance(s.get("correctness"), (int, float))]
+    # Only fully-graded rows are averaged. A row missing a dimension is a fact about the
+    # judge, not about the decision, and including it would bias the corpus average
+    # downward while looking like evidence about the pipeline.
+    graded = [s for s in scores if isinstance(s.get("rubric_score"), (int, float))]
     parse_failures = sum(1 for s in scores if s.get("parse_failed"))
-    avg_correctness = _avg(valid_scores, "correctness")
-    avg_reasoning = _avg(valid_scores, "reasoning")
-    avg_completeness = _avg(valid_scores, "completeness")
-    avg_score = (avg_correctness + avg_reasoning + avg_completeness) / 3 if valid_scores else 0
+    incomplete = sum(1 for s in scores if s.get("incomplete"))
+
+    avg_correctness = _avg(graded, "correctness")
+    avg_reasoning = _avg(graded, "reasoning")
+    avg_completeness = _avg(graded, "completeness")
+    # The headline number is weighted, not a flat mean: getting the action right matters
+    # more than explaining it well. See RUBRIC_WEIGHTS.
+    avg_rubric = _avg(graded, "rubric_score")
 
     return {
         "run_id": run_id,
         "total_decisions": len(decisions),
         "sample_size": len(sampled),
-        "evaluated": len(valid_scores),
+        "evaluated": len(graded),
         "parse_failures": parse_failures,
+        "incomplete_grades": incomplete,
+        "rubric_weights": RUBRIC_WEIGHTS,
         "scores": scores,
         "avg_correctness": round(avg_correctness, 2),
         "avg_reasoning": round(avg_reasoning, 2),
         "avg_completeness": round(avg_completeness, 2),
-        "avg_score": round(avg_score, 2),
+        # 0-1 weighted composite. `avg_score` is kept as an alias so existing consumers
+        # do not break, but it now carries the weighted value, not a flat mean.
+        "avg_rubric_score": round(avg_rubric, 3),
+        "avg_score": round(avg_rubric, 3),
     }
 
 
@@ -255,8 +266,74 @@ def _build_judge_context(decision: dict, es_store) -> str:
     return "\n\n".join(parts)
 
 
+#: Dimensions the judge must score, and their weight in the composite.
+#:
+#: correctness must weigh MORE THAN THE OTHER TWO COMBINED, not merely more than each.
+#: At 0.50/0.30/0.20 a wrong action explained perfectly (1/5/5) and a right action
+#: explained terribly (5/1/1) both score 0.6 — the weighting reads as if correctness
+#: dominates while actually making the two exactly equivalent. A wrong DEPRECATE is a
+#: deleted test; no quality of prose compensates for it.
+RUBRIC_WEIGHTS: dict[str, float] = {
+    "correctness":  0.60,
+    "reasoning":    0.25,
+    "completeness": 0.15,
+}
+_SCORE_MIN, _SCORE_MAX = 1, 5
+
+
+def coerce_dimension(value) -> int | None:
+    """
+    One rubric score as an int in 1..5, or None if the judge did not give a usable one.
+
+    None rather than 0 matters. `int(result.get(field, 0))` scored a missing dimension
+    as zero, which is indistinguishable from a decision the judge rated as terrible —
+    so a judge that omitted a field silently dragged the corpus average down and looked
+    like evidence about the pipeline. Out-of-range values are clamped rather than
+    discarded: a judge answering 7 on a 1-5 scale means "as high as it goes".
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    return max(_SCORE_MIN, min(number, _SCORE_MAX))
+
+
+def rubric_score(grade: dict) -> float | None:
+    """
+    Weighted composite of the rubric dimensions, normalised to 0-1.
+
+    None when any dimension is missing — a partial grade must not be averaged into a
+    number that reads as complete. Callers report those separately.
+    """
+    values = {d: coerce_dimension(grade.get(d)) for d in RUBRIC_WEIGHTS}
+    if any(v is None for v in values.values()):
+        return None
+    total_weight = sum(RUBRIC_WEIGHTS.values())
+    weighted = sum(values[d] * w for d, w in RUBRIC_WEIGHTS.items())
+    return round(weighted / (_SCORE_MAX * total_weight), 3)
+
+
+def missing_dimensions(grade: dict) -> list[str]:
+    """Rubric dimensions the judge failed to supply a usable score for."""
+    return sorted(d for d in RUBRIC_WEIGHTS if coerce_dimension(grade.get(d)) is None)
+
+
+def _extract_json(text: str) -> str:
+    """Strip markdown fencing a judge may wrap its JSON in."""
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        parts = stripped.split("```")
+        if len(parts) > 1:
+            stripped = parts[1]
+        if stripped.lstrip().lower().startswith("json"):
+            stripped = stripped.lstrip()[4:]
+    return stripped.strip()
+
+
 def _grade_decision(llm, context: str) -> dict:
-    """Call the judge LLM and parse its response."""
+    """Call the judge LLM and parse its response into a scored rubric."""
     from langchain_core.messages import HumanMessage, SystemMessage
 
     response = llm.invoke([
@@ -265,27 +342,33 @@ def _grade_decision(llm, context: str) -> dict:
     ])
 
     text = response.content.strip()
-    # Try to parse JSON from the response
     try:
-        # Handle potential markdown wrapping
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-        result = json.loads(text)
-        return {
-            "correctness": int(result.get("correctness", 0)),
-            "reasoning": int(result.get("reasoning", 0)),
-            "completeness": int(result.get("completeness", 0)),
-            "comment": result.get("comment", ""),
-        }
+        result = json.loads(_extract_json(text))
     except (json.JSONDecodeError, ValueError) as e:
-        logger.warning(f"Judge returned non-JSON: {text[:200]}")
+        logger.warning("Judge returned non-JSON: %s", text[:200])
         return {
             "error": f"Judge response was not valid JSON: {e}",
             "parse_failed": True,
             "raw_excerpt": text[:500],
         }
+    if not isinstance(result, dict):
+        return {
+            "error": "Judge response was JSON but not an object",
+            "parse_failed": True,
+            "raw_excerpt": text[:500],
+        }
+
+    grade: dict = {d: coerce_dimension(result.get(d)) for d in RUBRIC_WEIGHTS}
+    grade["comment"] = str(result.get("comment", ""))[:1000]
+
+    absent = missing_dimensions(result)
+    if absent:
+        # Recorded, not silently zeroed: this is a fact about the judge, not the decision.
+        grade["missing_dimensions"] = absent
+        grade["incomplete"] = True
+        logger.warning("Judge omitted rubric dimension(s): %s", absent)
+    grade["rubric_score"] = rubric_score(result)
+    return grade
 
 
 def _avg(scores: list[dict], field: str) -> float:

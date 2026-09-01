@@ -554,6 +554,41 @@ async def add_comment(issue_key: str, comment: str) -> Any:
     })
 
 
+async def get_labels(test_key: str) -> list[str]:
+    """
+    Current labels on an issue.
+
+    Deprecation is a label change, so this is what a pre-deprecation snapshot has to
+    capture — and the only thing a rollback can put back.
+    """
+    validated_key = _validate_jira_key(test_key)
+    result = await _call("search_issues", {
+        "jql": f"issue = {validated_key}",
+        "maxResults": 1,
+        "fields": ["labels"],
+    })
+    if isinstance(result, dict):
+        issues = result.get("issues", [])
+        if issues:
+            return list(issues[0].get("fields", {}).get("labels", []) or [])
+    return []
+
+
+async def set_labels(test_key: str, labels: list[str]) -> Any:
+    """
+    Replace an issue's labels outright.
+
+    Used by rollback to restore a snapshot. Deliberately a replace and not a merge:
+    the snapshot is the whole label set as it was, so merging would leave DEPRECATED
+    in place and the rollback would silently do nothing.
+    """
+    validated_key = _validate_jira_key(test_key)
+    return await _call("update_issue", {
+        "issueKey": validated_key,
+        "fields": {"labels": list(labels)},
+    })
+
+
 async def deprecate_test(test_key: str, reason: str) -> None:
     """
     Mark a test as deprecated: appends DEPRECATED label + a comment explaining why.
@@ -562,16 +597,7 @@ async def deprecate_test(test_key: str, reason: str) -> None:
     validated_key = _validate_jira_key(test_key)
 
     # First fetch existing labels so we can append rather than overwrite
-    result = await _call("search_issues", {
-        "jql": f"issue = {validated_key}",
-        "maxResults": 1,
-        "fields": ["labels"],
-    })
-    existing_labels = []
-    if isinstance(result, dict):
-        issues = result.get("issues", [])
-        if issues:
-            existing_labels = issues[0].get("fields", {}).get("labels", [])
+    existing_labels = await get_labels(validated_key)
 
     # Append DEPRECATED if not already present
     if "DEPRECATED" not in existing_labels:

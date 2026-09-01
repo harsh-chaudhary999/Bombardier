@@ -20,9 +20,11 @@ import io
 import json
 import logging
 import os
+import time
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Annotated
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -45,8 +47,15 @@ from agents.writeback import run_writeback
 from agents.incremental import run_incremental_analysis
 from embeddings.rank_filter import relative_cut, separation
 from embeddings.reranker import Reranker
+from integrations import webhook
 from observability.phase_ledger import verify_ledger_writable
-from observability.request_norm import normalize_module_list
+from observability.request_norm import (
+    GAP_RISKS,
+    merge_section_coverage,
+    normalize_module_list,
+    unknown_module_error,
+    unknown_modules,
+)
 
 def _configure_logging() -> None:
     """
@@ -115,6 +124,32 @@ def _env_default_model() -> str:
     with QA_DEFAULT_MODEL for high-volume or cost-sensitive deployments.
     """
     return os.environ.get("QA_DEFAULT_MODEL", "claude-opus-5")
+
+# ─── Confluence webhook ───────────────────────────────────────────────────────
+# Shared secret for HMAC verification. NO DEFAULT ON PURPOSE: without it the endpoint
+# is disabled entirely. An unauthenticated webhook that triggers analysis is a way for
+# anyone who can reach the port to spend the deployment's LLM budget, so "no secret
+# configured" must mean "off", never "open".
+CONFLUENCE_WEBHOOK_SECRET = os.environ.get("QA_CONFLUENCE_WEBHOOK_SECRET", "").strip()
+# Minimum gap between reacting to two events for the same page. Confluence fires an
+# event per save, so an editing session emits a burst; without this each save would
+# start its own ingest and analysis.
+WEBHOOK_COOLDOWN_SEC = int(os.environ.get("QA_WEBHOOK_COOLDOWN_SEC", "900"))
+# Re-analyse after re-ingesting when the page has been analysed before. Incremental,
+# so an edit that changed nothing testable costs almost nothing.
+WEBHOOK_ANALYZE = os.environ.get("QA_WEBHOOK_ANALYZE", "1").strip() not in ("", "0", "false", "False")
+# Run a FULL analysis for a page that has never been analysed. Off by default — a full
+# run on every newly-edited page in a space is a large, unbounded token spend.
+WEBHOOK_ANALYZE_NEW = os.environ.get("QA_WEBHOOK_ANALYZE_NEW", "0").strip() not in ("", "0", "false", "False")
+
+_webhook_debounce = webhook.Debounce(WEBHOOK_COOLDOWN_SEC)
+
+
+# How long a decision may sit unreviewed before it is reported as overdue.
+REVIEW_SLA_DAYS = int(os.environ.get("QA_REVIEW_SLA_DAYS", "30"))
+# The daily check is on by default: an unreviewed DEPRECATE sitting for a month is
+# exactly the failure this pipeline exists to make visible. Set 0 to silence it.
+REVIEW_SLA_ALERTS = os.environ.get("QA_REVIEW_SLA_ALERTS", "1").strip() not in ("", "0", "false", "False")
 
 # API key authentication — set QA_ENGINE_API_KEY to enable
 _API_KEY = os.environ.get("QA_ENGINE_API_KEY", "")
@@ -307,8 +342,11 @@ async def lifespan(app: FastAPI):
         _t["fast"], _t["reasoning"], _t["tiered"],
     )
 
-    # Nightly test sync — 20:30 UTC daily
+    # Scheduled jobs. Started whenever ANY job is registered — it previously started
+    # only when XRAY_PROJECT_KEY was set, so a job added later would have been silently
+    # dead on any deployment that does not use nightly sync.
     scheduler = AsyncIOScheduler()
+
     if DEFAULT_PROJECT_KEY:
         scheduler.add_job(
             _nightly_sync,
@@ -316,11 +354,25 @@ async def lifespan(app: FastAPI):
             id="nightly_test_sync",
             replace_existing=True,
         )
-        scheduler.start()
-        app.state.scheduler = scheduler
         logger.info(f"Nightly sync scheduled for project '{DEFAULT_PROJECT_KEY}' at 20:30 UTC")
     else:
         logger.info("XRAY_PROJECT_KEY not set — nightly sync disabled. Trigger via POST /sync/tests")
+
+    if REVIEW_SLA_ALERTS:
+        scheduler.add_job(
+            _review_sla_alert,
+            CronTrigger(hour=9, minute=0, timezone="UTC"),
+            id="review_sla_alert",
+            replace_existing=True,
+        )
+        logger.info(
+            "Review SLA check scheduled daily at 09:00 UTC (window: %s days)",
+            REVIEW_SLA_DAYS,
+        )
+
+    if scheduler.get_jobs():
+        scheduler.start()
+        app.state.scheduler = scheduler
 
     yield
 
@@ -330,6 +382,46 @@ async def lifespan(app: FastAPI):
     for run_id, task in list(_background_tasks.items()):
         task.cancel()
     logger.info("QA Intelligence Engine shutting down.")
+
+
+async def _review_sla_alert():
+    """
+    Daily check for decisions still unreviewed past the SLA window.
+
+    Emits a log line and a gauge. There is no notification channel configured here, and
+    inventing one (email, Slack) would be a deployment decision this service should not
+    make — the gauge is the hook: alert on `qa_decisions_overdue` in whatever already
+    watches /metrics/prometheus.
+
+    Never raises. A failing scheduled job must not take down the event loop.
+    """
+    try:
+        pg: PGStore = app.state.pg_store
+        loop = asyncio.get_running_loop()
+        total = await loop.run_in_executor(
+            None, lambda: pg.count_overdue_decisions(days=REVIEW_SLA_DAYS))
+
+        try:
+            from observability.metrics import metrics
+            metrics.set("qa_decisions_overdue", float(total))
+        except ImportError:
+            pass
+
+        if not total:
+            logger.info("Review SLA: no decisions overdue (window %s days)", REVIEW_SLA_DAYS)
+            return
+
+        sample = await loop.run_in_executor(
+            None, lambda: pg.get_overdue_decisions(days=REVIEW_SLA_DAYS, limit=5))
+        oldest = sample[0] if sample else {}
+        logger.warning(
+            "Review SLA: %s decision(s) unreviewed for more than %s days. Oldest: "
+            "id=%s action=%s jira_key=%s age=%.0f days (run %s). See GET /decisions/overdue",
+            total, REVIEW_SLA_DAYS, oldest.get("id"), oldest.get("action"),
+            oldest.get("jira_key"), oldest.get("age_days") or 0, oldest.get("run_id"),
+        )
+    except Exception as exc:
+        logger.warning("Review SLA check failed: %s", exc)
 
 
 async def _nightly_sync():
@@ -1181,6 +1273,28 @@ async def _ensure_ingested(
         }
 
 
+def _require_known_modules(module_n: list[str] | None, es: ESStore) -> None:
+    """
+    Reject a module filter that matches nothing in the test index.
+
+    The decision itself lives in observability.request_norm so it is testable without
+    the web stack; this wrapper only turns it into an HTTP response and logs the
+    partial-match case.
+    """
+    if not module_n:
+        return
+    available = es.get_available_modules()
+    error = unknown_module_error(module_n, available)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    missing = unknown_modules(module_n, available)
+    if missing:
+        logger.warning(
+            "Module filter contains %s unknown module(s), searching the rest: %s",
+            len(missing), missing,
+        )
+
+
 class AnalysePRDRequest(BaseModel):
     prd_source_id: str              # ES source_id, e.g. "confluence:1234567890"
     module: list[str] | None = None # restrict test search to these modules
@@ -1219,6 +1333,7 @@ async def analyse_prd(request: Request, req: AnalysePRDRequest):
     module_n = normalize_module_list(req.module)
     if module_n:
         logger.info("analyze/prd module filter (normalized): %s", module_n)
+    _require_known_modules(module_n, app.state.es_store)
 
     ensured = await _ensure_ingested(
         req.prd_source_id,
@@ -1279,6 +1394,7 @@ async def analyse_preview(request: Request, req: AnalysePRDRequest):
     If the PRD has not been ingested yet, it is ingested automatically first.
     """
     module_n = normalize_module_list(req.module)
+    _require_known_modules(module_n, app.state.es_store)
     await _ensure_ingested(
         req.prd_source_id,
         app.state.pg_store,
@@ -1323,6 +1439,7 @@ async def analyse_validate(request: Request, req: ValidatePRDRequest):
       3. For each section heading, what other knowledge-base/Confluence docs match
     """
     module_n = normalize_module_list(req.module)
+    _require_known_modules(module_n, app.state.es_store)
     await _ensure_ingested(
         req.prd_source_id,
         app.state.pg_store,
@@ -1519,7 +1636,10 @@ async def execute_writeback(request: Request, req: WritebackRequest):
       UPDATE    → update test steps/summary in Xray
       DEPRECATE → add DEPRECATED label + comment in Jira
       CREATE    → bulk-create new tests in Xray (requires project_key)
-      QUESTION  → mark written_back (no Xray action)
+      QUESTION  → post the question as a Jira comment on the test
+
+    DEPRECATE snapshots the test's labels first, so the change can be undone with
+    POST /writeback/rollback/{decision_id}.
 
     Blocking: waits for all MCP calls to finish (HTTP 200). Use dry_run for a safe preview.
     Global write-back (all runs) requires QA_WRITEBACK_ALLOW_GLOBAL=1.
@@ -1540,6 +1660,353 @@ async def execute_writeback(request: Request, req: WritebackRequest):
         es_store=app.state.es_store,
     )
     return result
+
+
+@app.post("/webhooks/confluence", status_code=202)
+@limiter.limit("60/minute")
+async def confluence_webhook(request: Request):
+    """
+    Receive Confluence page events and refresh the affected PRD.
+
+    Configure in Confluence (Settings → Webhooks) pointing at this URL, with the same
+    secret as QA_CONFLUENCE_WEBHOOK_SECRET. **Without that secret the endpoint is
+    disabled** — it triggers work that costs money, so it is never open by default.
+
+    What happens on an accepted event:
+      1. The page is re-ingested (forced, because its Confluence version has changed
+         but a matching version would otherwise skip it).
+      2. If it has been analysed before, an incremental analysis runs — which is nearly
+         free when the edit changed nothing testable.
+      3. If it has never been analysed, nothing further happens unless
+         QA_WEBHOOK_ANALYZE_NEW=1, since a full run per newly-edited page is unbounded.
+
+    Repeat events for the same page inside QA_WEBHOOK_COOLDOWN_SEC are acknowledged and
+    dropped: Confluence fires once per save, so an editing session is a burst.
+
+    Always returns 202 for events it understands but chooses not to act on — a webhook
+    sender treats a 4xx as a delivery failure and will retry it.
+    """
+    if not CONFLUENCE_WEBHOOK_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="Webhook endpoint is disabled. Set QA_CONFLUENCE_WEBHOOK_SECRET to "
+                   "enable it, and configure the same secret in Confluence.",
+        )
+
+    body = await request.body()
+    if not webhook.signature_ok(
+            CONFLUENCE_WEBHOOK_SECRET, body,
+            request.headers.get("x-hub-signature-256")):
+        logger.warning("Rejected Confluence webhook: bad or missing signature")
+        raise HTTPException(status_code=401, detail="Invalid or missing signature")
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Body is not valid JSON")
+
+    event = webhook.event_name(payload)
+    if not webhook.should_trigger(event):
+        return {"status": "ignored", "reason": f"event {event!r} is not a page change"}
+
+    page_id = webhook.page_id(payload)
+    if not page_id:
+        return {"status": "ignored", "reason": "no numeric page id in payload"}
+
+    wait = _webhook_debounce.check(page_id)
+    if wait:
+        return {"status": "debounced", "page_id": page_id, "retry_after_s": wait}
+
+    prd_source_id = f"confluence:{page_id}"
+    pg: PGStore = app.state.pg_store
+    loop = asyncio.get_running_loop()
+    previous = await loop.run_in_executor(
+        None, lambda: pg.get_last_analysis_run(prd_source_id))
+
+    ingest_run_id = str(uuid.uuid4())
+    _track_task(ingest_run_id, run_ingest(
+        source_type="confluence",
+        source=page_id,
+        module=None,
+        embed_client=app.state.embed_client,
+        es_store=app.state.es_store,
+        pg_store=pg,
+        run_id=ingest_run_id,
+        force=True,
+    ))
+
+    result = {
+        "status": "accepted",
+        "event": event,
+        "page_id": page_id,
+        "prd_source_id": prd_source_id,
+        "ingest_run_id": ingest_run_id,
+        "analysis_run_id": None,
+        "analysis": "not_started",
+    }
+
+    if previous and WEBHOOK_ANALYZE:
+        analysis_run_id = str(uuid.uuid4())
+        _track_task(analysis_run_id, run_incremental_analysis(
+            prd_source_id=prd_source_id,
+            previous_run_id=previous["run_id"],
+            module=None,
+            embed_client=app.state.embed_client,
+            es_store=app.state.es_store,
+            pg_store=pg,
+            run_id=analysis_run_id,
+            provider=_env_default_provider(),
+            model=_env_default_model(),
+            reranker=getattr(app.state, "reranker", None),
+        ))
+        result["analysis_run_id"] = analysis_run_id
+        result["analysis"] = "incremental"
+    elif not previous and WEBHOOK_ANALYZE_NEW:
+        analysis_run_id = str(uuid.uuid4())
+        _track_task(analysis_run_id, run_analysis(
+            prd_source_id=prd_source_id,
+            module=None,
+            embed_client=app.state.embed_client,
+            es_store=app.state.es_store,
+            pg_store=pg,
+            run_id=analysis_run_id,
+            provider=_env_default_provider(),
+            model=_env_default_model(),
+            reranker=getattr(app.state, "reranker", None),
+        ))
+        result["analysis_run_id"] = analysis_run_id
+        result["analysis"] = "full"
+    elif not previous:
+        result["analysis"] = "skipped_never_analysed"
+    else:
+        result["analysis"] = "skipped_disabled"
+
+    logger.info(
+        "Confluence webhook: %s for %s — ingest=%s analysis=%s",
+        event, prd_source_id, ingest_run_id, result["analysis"],
+    )
+    return result
+
+
+@app.get("/decisions/overdue")
+@limiter.limit("30/minute")
+def decisions_overdue(
+    request: Request,
+    days: int = Query(default=None, ge=1, le=365,
+                      description="SLA window; defaults to QA_REVIEW_SLA_DAYS"),
+    limit: int = Query(default=50, ge=1, le=500),
+):
+    """
+    Decisions still awaiting review past the SLA window.
+
+    Oldest first. The count is the whole backlog; the list is capped by `limit`, so a
+    large backlog does not turn a status check into a huge response.
+
+    `by_action` matters more than the total: a hundred overdue KEEPs is a queue nobody
+    has got to, while one overdue DEPRECATE is a test that may be about to disappear
+    without anyone having agreed to it.
+    """
+    window = REVIEW_SLA_DAYS if days is None else days
+    pg: PGStore = app.state.pg_store
+    total = pg.count_overdue_decisions(days=window)
+    rows = pg.get_overdue_decisions(days=window, limit=limit) if total else []
+
+    by_action: dict[str, int] = {}
+    for r in rows:
+        by_action[r["action"]] = by_action.get(r["action"], 0) + 1
+
+    return {
+        "sla_days": window,
+        "overdue_count": total,
+        "returned": len(rows),
+        "by_action": by_action,
+        "oldest_age_days": round(rows[0]["age_days"], 1) if rows else None,
+        "decisions": rows,
+    }
+
+
+@app.get("/analyze/coverage-map/{run_id}")
+@limiter.limit("30/minute")
+def analyze_coverage_map(request: Request, run_id: str):
+    """
+    Section-by-section coverage for an analysis run.
+
+    A single coverage score cannot distinguish a section that was checked and found
+    correct from one the agent never reached — both are just "not counted". This lists
+    every testable section in the document with what was actually concluded about it:
+
+      uncovered  — no decision recorded (the section list comes from the document, so
+                   these appear here even though they are absent from the decisions table)
+      unverified — only CREATE: a gap was found, nothing tests it yet
+      shrinking  — only DEPRECATE: coverage is being removed
+      questioned — only QUESTION: the agent could not decide
+      covered    — at least one KEEP or UPDATE
+
+    Meta sections (Background, Success Metrics, …) are excluded — they carry no
+    requirements and would dilute the picture.
+    """
+    from agents.analysis_agent import (
+        _is_meta_heading,
+        _normalize_heading_for_coverage as _norm,
+    )
+
+    pg: PGStore = app.state.pg_store
+    run = pg.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail=f"No run with run_id={run_id}")
+
+    rows = pg.get_coverage_map_data(run_id)
+    # Decisions are keyed on agent-authored free text; headings come verbatim from
+    # Elasticsearch. Both sides are normalised, the same trap that once made incremental
+    # carry-forward silently carry nothing.
+    by_section = {_norm(r.get("prd_section") or ""): r for r in rows}
+
+    prd_source = run.get("prd_source")
+    sections: list[dict] = []
+    unmatched: list[str] = []
+
+    if prd_source:
+        es: ESStore = app.state.es_store
+        from elasticsearch import helpers as es_helpers
+
+        headings: list[str] = []
+        seen: set[str] = set()
+        for hit in es_helpers.scan(
+            es._client,
+            index="qa_prd_chunks",
+            query={"query": {"term": {"source_id": prd_source}},
+                   "_source": ["section_heading", "chunk_index"]},
+            scroll="2m",
+            size=500,
+        ):
+            heading = (hit["_source"].get("section_heading") or "").strip()
+            if heading and heading not in seen:
+                seen.add(heading)
+                headings.append(heading)
+
+        # Decisions whose section label matches no heading are surfaced separately:
+        # the same mismatch also stops incremental carry-forward finding anything.
+        sections, unmatched = merge_section_coverage(
+            [(h, _norm(h)) for h in headings if not _is_meta_heading(h)],
+            by_section,
+        )
+
+    summary: dict[str, int] = {risk: 0 for risk in GAP_RISKS}
+    for s in sections:
+        summary[s["gap_risk"]] += 1
+
+    return {
+        "run_id": run_id,
+        "prd_source": prd_source,
+        "status": run.get("status"),
+        "testable_sections": len(sections),
+        "summary": summary,
+        "sections": sections,
+        # Present but not counted above — these decisions exist and reference a section
+        # name that is not in the document.
+        "decisions_with_unmatched_section": unmatched,
+        "note": None if prd_source else
+                "This run has no prd_source recorded, so the document's section list "
+                "could not be loaded and uncovered sections cannot be shown.",
+    }
+
+
+class RollbackRequest(BaseModel):
+    # Defaults to a preview. Undoing a write-back is itself a write, and the caller
+    # reaching for it is usually already reacting to a mistake.
+    dry_run: bool = True
+
+
+@app.post("/writeback/rollback/{decision_id}", status_code=200)
+@limiter.limit("20/minute")
+async def rollback_writeback(request: Request, decision_id: int, req: RollbackRequest):
+    """
+    Undo a DEPRECATE that has been written back, restoring the test's original labels.
+
+    Only DEPRECATE is reversible, and only when a `pre_deprecation_snapshot` was taken
+    at write-back time. Decisions written back before snapshotting existed cannot be
+    rolled back here — the original label set is simply not recorded anywhere.
+
+    Restores labels exactly as captured, which removes DEPRECATED. It does not undo the
+    explanatory Jira comment: the comment is a true record that the deprecation happened,
+    and the rollback adds its own alongside it.
+
+    dry_run defaults to true — call with {"dry_run": false} to apply.
+    """
+    pg: PGStore = app.state.pg_store
+    row = pg.get_decision_by_id(decision_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No decision with id={decision_id}")
+    if row.get("action") != "deprecate":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only DEPRECATE decisions can be rolled back; id={decision_id} is "
+                   f"{row.get('action')!r}",
+        )
+    if not row.get("written_back"):
+        raise HTTPException(
+            status_code=400,
+            detail="Decision has not been written back — there is nothing to undo. "
+                   "Reject it in review instead.",
+        )
+
+    content = row.get("updated_content") or {}
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except json.JSONDecodeError:
+            content = {}
+    snapshot = content.get("pre_deprecation_snapshot")
+    if not snapshot or not isinstance(snapshot, dict):
+        raise HTTPException(
+            status_code=409,
+            detail="No pre_deprecation_snapshot on this decision, so the original labels "
+                   "are unknown. It was written back before snapshotting existed, or the "
+                   "labels could not be read at the time.",
+        )
+
+    jira_key = row.get("jira_key") or snapshot.get("jira_key")
+    if not jira_key:
+        raise HTTPException(status_code=400, detail="Decision has no jira_key")
+
+    labels = list(snapshot.get("labels") or [])
+    if req.dry_run:
+        from integrations import xray_client
+        try:
+            current = await xray_client.get_labels(jira_key)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Could not read {jira_key}: {exc}")
+        return {
+            "dry_run": True,
+            "decision_id": decision_id,
+            "jira_key": jira_key,
+            "current_labels": current,
+            "would_restore": labels,
+            "captured_at": snapshot.get("captured_at"),
+        }
+
+    from integrations import xray_client
+    try:
+        await xray_client.set_labels(jira_key, labels)
+        await xray_client.add_comment(
+            jira_key,
+            "[QA Intelligence Engine] Deprecation rolled back — labels restored to their "
+            f"state at {snapshot.get('captured_at') or 'write-back time'}.",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Rollback failed for {jira_key}: {exc}")
+
+    pg.merge_decision_updated_content(decision_id, {
+        "rolled_back_at": datetime.now(timezone.utc).isoformat(),
+    })
+    logger.info("Rolled back deprecation of %s (decision %s)", jira_key, decision_id)
+    return {
+        "dry_run": False,
+        "status": "rolled_back",
+        "decision_id": decision_id,
+        "jira_key": jira_key,
+        "restored_labels": labels,
+    }
 
 
 # ─── Incremental analysis ────────────────────────────────────────────────────
@@ -1584,6 +2051,7 @@ async def analyse_incremental(request: Request, req: IncrementalAnalysisRequest)
         )
 
     module_n = normalize_module_list(req.module)
+    _require_known_modules(module_n, app.state.es_store)
     if module_n:
         logger.info("analyze/incremental module filter (normalized): %s", module_n)
 

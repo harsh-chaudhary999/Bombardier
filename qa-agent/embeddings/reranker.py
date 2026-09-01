@@ -130,13 +130,35 @@ class Reranker:
     # Body-field names in priority order, covering both index shapes.
     _TEXT_FIELDS = ("chunk_text", "summary", "_text")
 
+    # The cross-encoder truncates its input at the model's max sequence length and says
+    # nothing about it. Only the ENRICHMENT used to be capped (description[:400],
+    # steps[:300]) while the body field was unbounded — so a large PRD chunk filled the
+    # window on its own and the description and steps appended after it were silently
+    # dropped. Since chunks legitimately reach ~1200 tokens, that is the common case on
+    # the PRD path, not an edge case.
+    #
+    # Budget in characters rather than tokens: the tokenizer is loaded but running it
+    # twice per pair (once here, once inside predict) buys precision we do not need for
+    # a cap whose job is only to keep the tail from being cut.
+    _MODEL_TOKEN_LIMIT = 512
+    _CHARS_PER_TOKEN = 3.5          # conservative for prose; tables tokenize denser
+    _QUERY_RESERVE_TOKENS = 128     # room for the query side of the pair plus separators
+
+    @classmethod
+    def _document_budget(cls) -> int:
+        return int((cls._MODEL_TOKEN_LIMIT - cls._QUERY_RESERVE_TOKENS) * cls._CHARS_PER_TOKEN)
+
     def _document_text(self, r: dict, text_field: str | None) -> str:
         """
-        Resolve the text to score for one result, then enrich it.
+        Resolve the text to score for one result, then enrich it — within a budget.
 
         Falls back across the known body fields so a caller that does not know the content
         shape still gets a real document, and finally to title/heading so a pair is never
         (query, "") when the record carries any text at all.
+
+        Parts are added most-identifying first (body, then description, then steps) and
+        the total is capped, so what the model actually reads is the informative head of
+        the document rather than whatever happened to fit.
         """
         order = ((text_field,) if text_field else ()) + self._TEXT_FIELDS
         doc_text = ""
@@ -151,12 +173,25 @@ class Reranker:
                 str(p) for p in (r.get("doc_title"), r.get("section_heading")) if p
             )
 
-        # Enrich with description (Xray test steps live here when steps_text is null)
-        description = r.get("description", "") or ""
-        if description:
-            doc_text = f"{doc_text}\n{description[:400]}"
-        # Also enrich with steps_text if available
-        steps = r.get("steps_text", "") or ""
-        if steps:
-            doc_text = f"{doc_text}\n{steps[:300]}"
-        return doc_text
+        budget = self._document_budget()
+        parts: list[str] = []
+        remaining = budget
+
+        def _take(text: str, share: int) -> None:
+            """Append up to `share` characters, never exceeding what is left overall."""
+            nonlocal remaining
+            if not text or remaining <= 0:
+                return
+            piece = text[: min(share, remaining)]
+            if piece:
+                parts.append(piece)
+                remaining -= len(piece)
+
+        # The body gets whatever it needs up to the whole budget; it is the document.
+        _take(doc_text, budget)
+        # Enrichment only competes for what the body left. Xray test steps live in
+        # `description` when steps_text is null, so it stays ahead of steps_text.
+        _take((r.get("description") or "").strip(), 400)
+        _take((r.get("steps_text") or "").strip(), 300)
+
+        return "\n".join(parts)

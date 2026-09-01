@@ -92,6 +92,85 @@ def install_html2text(render=None) -> None:
     sys.modules["html2text"] = mod
 
 
+def install_langchain() -> None:
+    """Stand-ins close enough to exercise real tool bodies via .invoke()."""
+    if "langchain_core" in sys.modules:
+        return
+
+    class _Msg:
+        def __init__(self, content=None, tool_call_id=None, **kw):
+            self.content = content
+            self.tool_call_id = tool_call_id
+            self.tool_calls = []
+
+    class _Tool:
+        def __init__(self, fn):
+            self._fn = fn
+            self.name = fn.__name__
+            self.description = fn.__doc__ or ""
+            self.args_schema = None
+
+        def invoke(self, args=None):
+            return self._fn(**(args or {}))
+
+        def __call__(self, *a, **kw):
+            return self._fn(*a, **kw)
+
+    msgs = types.ModuleType("langchain_core.messages")
+    msgs.HumanMessage = msgs.SystemMessage = msgs.ToolMessage = _Msg
+    tools_mod = types.ModuleType("langchain_core.tools")
+    tools_mod.tool = _Tool
+    sys.modules["langchain_core"] = types.ModuleType("langchain_core")
+    sys.modules["langchain_core.messages"] = msgs
+    sys.modules["langchain_core.tools"] = tools_mod
+
+
+def install_datastores() -> None:
+    """Elasticsearch, psycopg2 and the MCP client — imported, never connected to."""
+    if "elasticsearch" not in sys.modules:
+        es = types.ModuleType("elasticsearch")
+        es.Elasticsearch = object
+        es.NotFoundError = type("NotFoundError", (Exception,), {})
+        es.helpers = types.SimpleNamespace(scan=lambda *a, **k: [])
+        sys.modules["elasticsearch"] = es
+
+    if "psycopg2" not in sys.modules:
+        pg = types.ModuleType("psycopg2")
+        pool = types.ModuleType("psycopg2.pool")
+        pool.ThreadedConnectionPool = object
+        extras = types.ModuleType("psycopg2.extras")
+        extras.Json = lambda v: v
+        extras.RealDictCursor = object
+        pg.pool, pg.extras = pool, extras
+        pg.OperationalError = type("OperationalError", (Exception,), {})
+        sys.modules.update({"psycopg2": pg, "psycopg2.pool": pool,
+                            "psycopg2.extras": extras})
+
+    if "mcp" not in sys.modules:
+        mcp = types.ModuleType("mcp")
+        mcp.ClientSession = object
+        client = types.ModuleType("mcp.client")
+        http = types.ModuleType("mcp.client.streamable_http")
+        http.streamablehttp_client = lambda *a, **k: None
+        sys.modules.update({"mcp": mcp, "mcp.client": client,
+                            "mcp.client.streamable_http": http})
+
+
+def install_sentence_transformers() -> None:
+    if "sentence_transformers" not in sys.modules:
+        mod = types.ModuleType("sentence_transformers")
+        mod.__getattr__ = lambda _k: types.SimpleNamespace()
+        sys.modules["sentence_transformers"] = mod
+
+
+def install_agent_deps() -> None:
+    """Everything agents.analysis_agent imports at module level."""
+    install_chunker_deps()
+    install_langchain()
+    install_datastores()
+    install_sentence_transformers()
+
+
 def install_chunker_deps() -> None:
     """
     The third-party packages ingestion.chunker imports.

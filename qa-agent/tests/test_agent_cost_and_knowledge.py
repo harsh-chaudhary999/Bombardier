@@ -171,14 +171,27 @@ class KnowledgeBundleTests(EnvIsolatedTest):
         # A doc that merely starts with a rule, not a fence.
         self.assertEqual(A._strip_frontmatter("----\ntitle"), "----\ntitle")
 
+    # Marker taken from the loaded files themselves, not a literal from their text.
+    # These documents hold the team's own rules and are edited regularly; asserting on
+    # a specific heading couples this test to wording that is expected to change.
+    @staticmethod
+    def _guidance_marker() -> str:
+        line = next(l for l in A._GUIDELINES.splitlines() if l.strip())
+        return line.strip()
+
+    @staticmethod
+    def _deprecation_marker() -> str:
+        line = next(l for l in A._DEPRECATION.splitlines() if l.strip())
+        return line.strip()
+
     def test_inline_mode_includes_guidance_body(self):
         prompt = A._system_prompt("anthropic")
-        self.assertIn("Naming Convention", prompt)     # from test-case-guidelines
-        self.assertIn("OUTDATED", prompt)              # from deprecation-rules
+        self.assertIn(self._guidance_marker(), prompt)     # from test-case-guidelines
+        self.assertIn(self._deprecation_marker(), prompt)  # from deprecation-rules
 
     def test_on_demand_mode_defers_guidance(self):
         prompt = A._system_prompt("ollama")
-        self.assertNotIn("Naming Convention", prompt)
+        self.assertNotIn(self._guidance_marker(), prompt)
         self.assertIn("read_knowledge", prompt)
         self.assertIn("test-case-guidelines.md", prompt)
 
@@ -189,14 +202,14 @@ class KnowledgeBundleTests(EnvIsolatedTest):
 
     def test_knowledge_mode_env_override_both_directions(self):
         os.environ["QA_AGENT_KNOWLEDGE_MODE"] = "on_demand"
-        self.assertNotIn("Naming Convention", A._system_prompt("anthropic"))
+        self.assertNotIn(self._guidance_marker(), A._system_prompt("anthropic"))
         os.environ["QA_AGENT_KNOWLEDGE_MODE"] = "inline"
-        self.assertIn("Naming Convention", A._system_prompt("ollama"))
+        self.assertIn(self._guidance_marker(), A._system_prompt("ollama"))
 
     def test_invalid_knowledge_mode_falls_back_to_provider_default(self):
         os.environ["QA_AGENT_KNOWLEDGE_MODE"] = "nonsense"
-        self.assertIn("Naming Convention", A._system_prompt("anthropic"))
-        self.assertNotIn("Naming Convention", A._system_prompt("ollama"))
+        self.assertIn(self._guidance_marker(), A._system_prompt("anthropic"))
+        self.assertNotIn(self._guidance_marker(), A._system_prompt("ollama"))
 
     def test_bundle_contains_expected_documents(self):
         self.assertGreaterEqual(set(A._knowledge_files()), {

@@ -26,6 +26,40 @@ logger = logging.getLogger(__name__)
 # Index names — change these to match your team's naming convention if needed
 INDEX_TEST_CASES = "qa_test_cases"
 INDEX_PRD_CHUNKS = "qa_prd_chunks"
+
+# Cross-module retrieval. Off by default: with it on, a module-scoped search can return
+# tests from any module, which is how you find a test filed under the wrong one — and
+# also how an analysis of one module starts recording decisions against another's tests.
+# Measure with eval/benchmark.py before enabling; see ADR-014 on opt-in retrieval changes.
+CROSS_MODULE_SEARCH = os.environ.get(
+    "QA_RETRIEVAL_CROSS_MODULE", "0"
+).strip() not in ("", "0", "false", "False")
+
+
+def _module_scope_clause(module_filter: list[str] | None) -> dict | None:
+    """
+    The module restriction applied to a test-case search, or None for no restriction.
+
+    Untagged tests are always included. A hard `terms` filter drops every document whose
+    `module` field is absent — tests synced before module tagging, or whose module could
+    not be derived — so they are invisible to every scoped search with no error anywhere.
+    That is the same rule search_similar_prd_chunks already applies to PRD chunks; the two
+    indexes disagreed on it, which is exactly the kind of silent divergence that hides.
+
+    With CROSS_MODULE_SEARCH on there is no restriction at all, and the caller is expected
+    to rely on ranking rather than filtering to keep other modules out.
+    """
+    if not module_filter or CROSS_MODULE_SEARCH:
+        return None
+    return {
+        "bool": {
+            "should": [
+                {"terms": {"module": module_filter}},
+                {"bool": {"must_not": {"exists": {"field": "module"}}}},
+            ],
+            "minimum_should_match": 1,
+        }
+    }
 # Single-document index: records active embedding/reranker model IDs for mismatch detection on startup
 INDEX_ENGINE_SETTINGS = "qa_engine_settings"
 
@@ -250,6 +284,60 @@ class ESStore:
 
     def ping(self) -> bool:
         return self._client.ping()
+
+    def get_test_embedding(self, jira_key: str) -> list[float] | None:
+        """
+        The stored vector for one test case, or None if absent.
+
+        Lets a caller ask "what else in the corpus is about this test?" without
+        re-embedding its text — the stored vector is also the one retrieval used, so
+        the comparison is consistent with how the test was found in the first place.
+        """
+        try:
+            resp = self._client.search(
+                index=INDEX_TEST_CASES,
+                query={"term": {"jira_key": jira_key}},
+                source=["embedding"],
+                size=1,
+            )
+        except Exception as exc:
+            logger.warning("Could not load embedding for %s: %s", jira_key, exc)
+            return None
+        hits = resp.get("hits", {}).get("hits", [])
+        if not hits:
+            return None
+        return hits[0].get("_source", {}).get("embedding") or None
+
+    def get_available_modules(self, max_terms: int = 100) -> list[str]:
+        """
+        Distinct module values present in the test case index.
+
+        Used to pre-flight a caller's module filter. Without this a misspelled or
+        renamed module produces a run that completes with zero decisions — which
+        looks like "the PRD is fully covered" rather than "nothing was searched".
+
+        Returns [] on any failure: validation must never be the reason an analysis
+        cannot start.
+        """
+        try:
+            resp = self._client.search(
+                index=INDEX_TEST_CASES,
+                size=0,
+                aggs={
+                    "modules": {
+                        "terms": {
+                            "field": "module",
+                            "size": max_terms,
+                            "order": {"_key": "asc"},
+                        }
+                    }
+                },
+            )
+        except Exception as exc:
+            logger.warning("Could not list available modules: %s", exc)
+            return []
+        buckets = resp.get("aggregations", {}).get("modules", {}).get("buckets", [])
+        return [b["key"] for b in buckets if b.get("key")]
 
     # ─── Test case embeddings ──────────────────────────────────────────────────
 
@@ -488,8 +576,9 @@ class ESStore:
             "k":              top_k,
             "num_candidates": num_candidates,
         }
-        if module_filter:
-            knn_query["filter"] = [{"terms": {"module": module_filter}}]
+        module_scope = _module_scope_clause(module_filter)
+        if module_scope is not None:
+            knn_query["filter"] = [module_scope]
 
         resp = self._client.search(
             index=INDEX_TEST_CASES,
@@ -529,10 +618,13 @@ class ESStore:
             resp = self._client.count(index=INDEX_TEST_CASES, query={"match_all": {}})
             total = resp["count"]
             return max(300, min(int(total * 0.20), 2000))
-        resp = self._client.count(
-            index=INDEX_TEST_CASES,
-            query={"terms": {"module": module_filter}},
-        )
+        # Same scope rule as the searches this sizes the pool for, or the estimate
+        # describes a different corpus from the one actually queried.
+        module_scope = _module_scope_clause(module_filter)
+        if module_scope is None:
+            resp = self._client.count(index=INDEX_TEST_CASES, query={"match_all": {}})
+            return max(300, min(int(resp["count"] * 0.20), 2000))
+        resp = self._client.count(index=INDEX_TEST_CASES, query=module_scope)
         module_size = resp["count"]
         return max(300, min(int(module_size * 0.20), 2000))
 
@@ -554,6 +646,7 @@ class ESStore:
         """
         num_candidates = max(100, top_k * 10)
         fetch_size = max(100, top_k * 2)  # fetch more than top_k so both lists have good coverage
+        module_scope = _module_scope_clause(module_filter)
         _source_fields = [
             "jira_key",
             "summary",
@@ -574,8 +667,8 @@ class ESStore:
             "k":              fetch_size,
             "num_candidates": num_candidates,
         }
-        if module_filter:
-            knn_query["filter"] = {"terms": {"module": module_filter}}
+        if module_scope is not None:
+            knn_query["filter"] = module_scope
 
         knn_resp = self._client.search(
             index=INDEX_TEST_CASES,
@@ -591,11 +684,11 @@ class ESStore:
                 "fields": ["summary^3", "description^2", "steps_text", "preconditions"],
             }
         }
-        if module_filter:
+        if module_scope is not None:
             text_query = {
                 "bool": {
                     "must":   text_query,
-                    "filter": [{"terms": {"module": module_filter}}],
+                    "filter": [module_scope],
                 }
             }
 

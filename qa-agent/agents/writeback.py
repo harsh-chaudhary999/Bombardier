@@ -28,6 +28,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
@@ -99,6 +100,72 @@ def _steps_from_outline(text: Any) -> list[dict] | None:
         {"action": a, "data": "", "expectedResult": e, "index": i}
         for i, (a, e) in enumerate(items, start=1)
     ]
+
+
+async def _pre_deprecation_snapshot(jira_key: str) -> dict | None:
+    """
+    Capture what deprecation is about to change, so it can be put back.
+
+    Only labels: `deprecate_test` appends a DEPRECATED label and adds a comment, and
+    changes nothing else. Snapshotting the folder or module would be recording state
+    that was never touched, and a rollback that "restored" them could move a test that
+    someone had legitimately re-filed since.
+
+    Returns None if the labels could not be read — the caller records that the decision
+    is not rollback-able rather than failing the run.
+    """
+    try:
+        labels = await xray_client.get_labels(jira_key)
+    except Exception as exc:
+        logger.warning("Could not snapshot labels for %s before deprecating: %s",
+                       jira_key, exc)
+        return None
+    return {
+        "jira_key": jira_key,
+        "labels": labels,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _question_is_commentable(decision: dict) -> bool:
+    """A question can only be posted where there is a test to post it on."""
+    return decision.get("action") == "question" and bool(decision.get("jira_key"))
+
+
+def _question_comment_body(
+    reason: str | None,
+    run_id: str | None,
+    prd_source: str | None,
+    prd_section: str | None,
+) -> str:
+    """
+    Render an open question as a Jira comment.
+
+    Carries the run and PRD section so the reader can find what prompted it months
+    later, and says plainly that nothing was changed — a comment on a test case
+    otherwise reads as though something was done to it.
+    """
+    body = [
+        "*[QA Intelligence Engine — open question]*",
+        "",
+        (reason or "").strip() or "(no reason recorded)",
+        "",
+    ]
+    context = []
+    if prd_source:
+        context.append(f"PRD: {prd_source}")
+    if prd_section:
+        context.append(f"Section: {prd_section}")
+    if run_id:
+        context.append(f"Run: {run_id}")
+    if context:
+        body.append("_" + " | ".join(context) + "_")
+        body.append("")
+    body.append(
+        "No change has been made to this test. Please confirm whether it is still "
+        "valid, then update the test or the PRD."
+    )
+    return "\n".join(body)
 
 
 def _resolve_prd_remote_url(prd_source: str, es_store: Any) -> str | None:
@@ -267,9 +334,38 @@ async def run_writeback(
                     content = {}
 
             try:
-                if action in ("keep", "question"):
+                if action == "keep":
+                    # Nothing to write: the test already matches the PRD.
                     pg_store.mark_written_back(decision_id)
-                    counts[action] = counts.get(action, 0) + 1
+                    counts["keep"] += 1
+
+                elif action == "question":
+                    # A question with nowhere to go is a dead end. Post it on the test
+                    # so the QA owner sees it in Jira rather than only in the review UI.
+                    if jira_key:
+                        try:
+                            await xray_client.add_comment(
+                                jira_key,
+                                _question_comment_body(
+                                    reason=reason,
+                                    run_id=run_id,
+                                    prd_source=decision.get("prd_source"),
+                                    prd_section=decision.get("prd_section"),
+                                ),
+                            )
+                            logger.info("  Commented question on %s", jira_key)
+                        except Exception as e:
+                            # Record the failure but still mark it written back — the
+                            # decision is reviewed and approved; a comment outage must
+                            # not strand it for re-processing on every later run.
+                            errors.append({
+                                "decision_id": decision_id,
+                                "jira_key": jira_key,
+                                "action": "question",
+                                "error": f"could not post question comment: {e}",
+                            })
+                    pg_store.mark_written_back(decision_id)
+                    counts["question"] += 1
 
                 elif action == "update":
                     if not jira_key:
@@ -331,6 +427,26 @@ async def run_writeback(
                     if not jira_key:
                         errors.append({"decision_id": decision_id, "error": "DEPRECATE decision missing jira_key"})
                         continue
+
+                    # Snapshot BEFORE the change, and persist it before making the change.
+                    # Ordering matters: a crash between the two leaves a snapshot with no
+                    # deprecation, which is harmless. The reverse — a deprecation with no
+                    # snapshot — is unrecoverable, and deprecation is the one irreversible
+                    # action this pipeline takes.
+                    snapshot = await _pre_deprecation_snapshot(jira_key)
+                    if snapshot:
+                        pg_store.merge_decision_updated_content(
+                            decision_id, {"pre_deprecation_snapshot": snapshot})
+                    else:
+                        # Recorded, not fatal: refusing to deprecate because the labels
+                        # could not be read would block the whole run on a read failure.
+                        errors.append({
+                            "decision_id": decision_id, "jira_key": jira_key,
+                            "action": "deprecate",
+                            "error": "could not snapshot labels before deprecating — "
+                                     "this decision is not rollback-able",
+                        })
+
                     await xray_client.deprecate_test(jira_key, reason)
                     pg_store.mark_written_back(decision_id)
                     counts["deprecate"] += 1

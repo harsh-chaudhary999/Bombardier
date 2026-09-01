@@ -20,6 +20,22 @@ logger = logging.getLogger(__name__)
 
 _POOL_GET_TIMEOUT = float(os.environ.get("PG_POOL_GETCONN_TIMEOUT_SEC", "10"))
 
+_VALID_CONFIDENCE = ("high", "medium", "low")
+
+
+def _coerce_confidence(value) -> str | None:
+    """
+    Normalise an agent-supplied confidence to the values the CHECK constraint allows.
+
+    Anything unrecognised becomes NULL. The column is a triage aid; a model that
+    answers "very high" or "3" must not cost us the decision it was attached to.
+    Case and surrounding whitespace are forgiven because they carry no meaning.
+    """
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    return text if text in _VALID_CONFIDENCE else None
+
 
 def _build_pool() -> psycopg2.pool.ThreadedConnectionPool:
     """Create a thread-safe connection pool (2–10 connections)."""
@@ -58,7 +74,13 @@ class PGStore:
     # ─── Pending decisions ─────────────────────────────────────────────────────
 
     def write_decision(self, decision: dict) -> int:
-        """Insert a single agent decision. Returns the new row id."""
+        """
+        Insert a single agent decision. Returns the new row id.
+
+        An unrecognised confidence value is stored as NULL rather than rejected —
+        the decision itself is worth more than the metadata, and a CHECK violation
+        here would lose it. See _coerce_confidence.
+        """
         prd_section = decision.get("prd_section")
         if isinstance(prd_section, str) and len(prd_section) > 500:
             prd_section = prd_section[:500]
@@ -71,6 +93,7 @@ class PGStore:
         written_back = decision.get("written_back")
         if written_back is None:
             written_back = False
+        confidence = _coerce_confidence(decision.get("confidence"))
         conn = self._get_conn()
         try:
             with conn.cursor() as cur:
@@ -78,9 +101,9 @@ class PGStore:
                     """
                     INSERT INTO qa_rag.pending_decisions
                         (run_id, jira_key, action, reason, updated_content,
-                         questions, prd_source, prd_section,
+                         questions, prd_source, prd_section, confidence,
                          reviewed, approved, reviewer_note, written_back, reviewed_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                             CASE WHEN COALESCE(%s, FALSE) THEN NOW() ELSE NULL END)
                     RETURNING id;
                     """,
@@ -93,6 +116,7 @@ class PGStore:
                         psycopg2.extras.Json(decision.get("questions")),
                         decision.get("prd_source"),
                         prd_section,
+                        confidence,
                         reviewed,
                         decision.get("approved"),
                         decision.get("reviewer_note"),
@@ -375,6 +399,162 @@ class PGStore:
                     (jira_key, max(1, min(limit, 50))),
                 )
                 return [dict(r) for r in cur.fetchall()]
+        finally:
+            self._put_conn(conn)
+
+    def get_last_analysis_run(self, prd_source: str) -> dict | None:
+        """
+        The most recent finished analysis of a PRD, or None if it has never been analysed.
+
+        `truncated` counts as finished: the run hit its turn limit but produced real
+        decisions, and those are worth diffing against rather than discarding.
+        Ingest runs are excluded — they carry the same prd_source but analysed nothing.
+        """
+        conn = self._get_conn()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT run_id, run_type, status, completed_at
+                      FROM qa_rag.sync_runs
+                     WHERE prd_source = %s
+                       AND run_type IN ('analysis', 'incremental_analysis')
+                       AND status IN ('completed', 'truncated', 'completed_with_errors')
+                     ORDER BY completed_at DESC NULLS LAST
+                     LIMIT 1;
+                    """,
+                    (prd_source,),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+        finally:
+            self._put_conn(conn)
+
+    def get_overdue_decisions(self, days: int = 30, limit: int = 200) -> list[dict]:
+        """
+        Unreviewed decisions older than `days`, oldest first.
+
+        The deadline is computed here rather than stored, so the SLA window is a
+        parameter and not a schema change. Only unreviewed rows can be overdue: a
+        decision that was reviewed and rejected is finished, not late.
+        """
+        conn = self._get_conn()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, run_id, jira_key, action, confidence,
+                           prd_source, prd_section, created_at,
+                           EXTRACT(EPOCH FROM (NOW() - created_at)) / 86400.0 AS age_days
+                      FROM qa_rag.pending_decisions
+                     WHERE reviewed = FALSE
+                       AND created_at < NOW() - (%s * INTERVAL '1 day')
+                     ORDER BY created_at ASC
+                     LIMIT %s;
+                    """,
+                    (days, limit),
+                )
+                return [dict(r) for r in cur.fetchall()]
+        finally:
+            self._put_conn(conn)
+
+    def count_overdue_decisions(self, days: int = 30) -> int:
+        """Total overdue decisions, uncapped — the listing above is limited."""
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) FROM qa_rag.pending_decisions
+                     WHERE reviewed = FALSE
+                       AND created_at < NOW() - (%s * INTERVAL '1 day');
+                    """,
+                    (days,),
+                )
+                return int(cur.fetchone()[0])
+        finally:
+            self._put_conn(conn)
+
+    def get_coverage_map_data(self, run_id: str) -> list[dict]:
+        """
+        Per-section decision counts for one run, for the coverage map.
+
+        Only covers sections the agent actually decided something about. Sections it
+        never reached are absent from this table entirely — the caller has to compare
+        against the document's real section list to find them, and those are the gaps
+        worth seeing.
+        """
+        conn = self._get_conn()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        prd_section,
+                        COUNT(*)                                          AS decisions,
+                        COUNT(*) FILTER (WHERE action = 'keep')           AS keep_count,
+                        COUNT(*) FILTER (WHERE action = 'update')         AS update_count,
+                        COUNT(*) FILTER (WHERE action = 'deprecate')      AS deprecate_count,
+                        COUNT(*) FILTER (WHERE action = 'create')         AS create_count,
+                        COUNT(*) FILTER (WHERE action = 'question')       AS question_count,
+                        COUNT(*) FILTER (WHERE confidence = 'high')       AS high_confidence,
+                        COUNT(*) FILTER (WHERE confidence = 'low')        AS low_confidence,
+                        COUNT(*) FILTER (WHERE confidence IS NULL)        AS unrated,
+                        COUNT(*) FILTER (WHERE approved IS TRUE)          AS approved_count,
+                        COUNT(*) FILTER (WHERE approved IS FALSE)         AS rejected_count,
+                        COUNT(*) FILTER (WHERE reviewed IS NOT TRUE)      AS unreviewed_count
+                    FROM qa_rag.pending_decisions
+                    WHERE run_id = %s
+                    GROUP BY prd_section
+                    ORDER BY prd_section NULLS FIRST;
+                    """,
+                    (run_id,),
+                )
+                return [dict(r) for r in cur.fetchall()]
+        finally:
+            self._put_conn(conn)
+
+    def get_decision_by_id(self, decision_id: int) -> dict | None:
+        """One decision row, or None. Used by rollback to inspect what was written."""
+        conn = self._get_conn()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM qa_rag.pending_decisions WHERE id = %s;",
+                    (decision_id,),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+        finally:
+            self._put_conn(conn)
+
+    def merge_decision_updated_content(self, decision_id: int, patch: dict) -> bool:
+        """
+        Shallow-merge keys into a decision's `updated_content` JSON.
+
+        Merged in the database rather than read-modify-written in Python: the agent and
+        the write-back worker both touch this column, and a read-modify-write would let
+        one silently discard the other's keys. Returns True if the row existed.
+        """
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE qa_rag.pending_decisions
+                       SET updated_content = COALESCE(updated_content, '{}'::jsonb) || %s::jsonb
+                     WHERE id = %s;
+                    """,
+                    (psycopg2.extras.Json(patch), decision_id),
+                )
+                updated = cur.rowcount > 0
+            conn.commit()
+            if not updated:
+                logger.warning("merge_decision_updated_content: no row id=%s", decision_id)
+            return updated
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             self._put_conn(conn)
 

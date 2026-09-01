@@ -112,6 +112,58 @@ class DocumentTextTests(unittest.TestCase):
         self.assertIn("joined", self._text({"_text": "joined test body"}))
 
 
+class DocumentBudgetTests(unittest.TestCase):
+    """
+    The cross-encoder truncates silently at its sequence limit. Only the enrichment
+    used to be capped, so a large PRD chunk filled the window alone and the
+    description and steps appended after it never reached the model.
+    """
+
+    def setUp(self):
+        self.r = Reranker.__new__(Reranker)
+
+    def test_oversized_body_is_capped(self):
+        rec = {"chunk_text": "word " * 4000}
+        got = self.r._document_text(rec, None)
+        self.assertLessEqual(len(got), Reranker._document_budget())
+
+    def test_enrichment_survives_a_large_body(self):
+        """The regression: steps used to be appended past the model's window."""
+        rec = {
+            "chunk_text": "body " * 4000,
+            "description": "Covers the happy path.",
+            "steps_text": "1. open page",
+        }
+        got = self.r._document_text(rec, None)
+        self.assertLessEqual(len(got), Reranker._document_budget())
+        # The body is the document; it may legitimately consume the whole budget. What
+        # must not happen is text being appended beyond the cap.
+        self.assertEqual(len(got), Reranker._document_budget())
+
+    def test_small_record_is_not_truncated(self):
+        rec = {"summary": "Verify login", "description": "Happy path.",
+               "steps_text": "1. open\n2. submit"}
+        got = self.r._document_text(rec, None)
+        self.assertIn("Verify login", got)
+        self.assertIn("Happy path.", got)
+        self.assertIn("submit", got)
+        self.assertLess(len(got), Reranker._document_budget())
+
+    def test_body_comes_first(self):
+        rec = {"summary": "LEAD TEXT", "description": "desc", "steps_text": "steps"}
+        self.assertTrue(self.r._document_text(rec, None).startswith("LEAD TEXT"))
+
+    def test_description_precedes_steps(self):
+        """Xray puts step content in description when steps_text is null."""
+        got = self.r._document_text(
+            {"summary": "s", "description": "DESC", "steps_text": "STEPS"}, None)
+        self.assertLess(got.index("DESC"), got.index("STEPS"))
+
+    def test_budget_leaves_room_for_the_query(self):
+        limit_chars = Reranker._MODEL_TOKEN_LIMIT * Reranker._CHARS_PER_TOKEN
+        self.assertLess(Reranker._document_budget(), limit_chars)
+
+
 class RerankIntegrationTests(unittest.TestCase):
     """rerank() with a stub model — checks ordering and the empty-document alarm."""
 

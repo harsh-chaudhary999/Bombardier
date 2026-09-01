@@ -380,6 +380,191 @@ def _is_meta_heading(heading: str) -> bool:
     return any(p.search(clean) for p in _META_HEADING_RULES)
 
 
+# ─── Guardrails on untrusted PRD content and on decision quality ──────────────
+
+_INJECTION_PATTERNS: tuple[re.Pattern, ...] = (
+    re.compile(r"IGNORE\s+(?:ALL\s+)?(?:PREVIOUS|PRIOR|ABOVE)\s+INSTRUCTIONS", re.IGNORECASE),
+    re.compile(r"DISREGARD\s+(?:ALL\s+)?(?:PREVIOUS|PRIOR|ABOVE)\s+INSTRUCTIONS", re.IGNORECASE),
+    re.compile(r"<\|\s*(?:system|user|assistant|im_start|im_end)\s*\|>", re.IGNORECASE),
+    re.compile(r"\[INST\].*?\[/INST\]", re.IGNORECASE | re.DOTALL),
+    re.compile(r"(?m)^\s*#{1,6}\s*(?:System|Human|Assistant)\s*:", re.IGNORECASE),
+    re.compile(r"(?m)^\s*-{3,}\s*SYSTEM\s*:", re.IGNORECASE),
+)
+
+
+def _sanitize_prd_content(text: str) -> str:
+    """
+    Strip known prompt-injection patterns from PRD text before it reaches the model.
+
+    PRD content is untrusted input on a privileged path: anyone who can edit a
+    Confluence page can put text into the analysis context. This is defence in
+    depth, not a guarantee — it is a denylist, and denylists leak. The system
+    prompt must also treat document content as data rather than instructions.
+
+    Deliberately narrow. The role-marker patterns are anchored to the start of a
+    line so an ordinary heading like '### Assumptions' is untouched; only the
+    conversational role markers ('### System:') match.
+    """
+    if not text:
+        return text
+    for pattern in _INJECTION_PATTERNS:
+        text = pattern.sub("[FILTERED]", text)
+    return text
+
+
+_MIN_REASON_CHARS = 30
+_REMOVAL_KEYWORDS = (
+    "remov", "replac", "obsolet", "discontinu", "no longer",
+    "deleted", "delete", "dropped", "retired", "superseded",
+)
+
+
+def _check_reason_quality(action: str, reason: str | None) -> str | None:
+    """
+    Return an error message for the agent, or None if the reason is acceptable.
+
+    A decision whose reason is 'N/A' is unreviewable — the reviewer cannot tell
+    whether the agent was right, so the decision is worthless even when correct.
+    DEPRECATE carries the extra requirement because it is the one irreversible
+    action: the reason must say what was removed, not merely that the test is
+    unwanted.
+    """
+    text = (reason or "").strip()
+    if len(text) < _MIN_REASON_CHARS:
+        return (
+            f"Error: reason is too short ({len(text)} chars). Provide at least "
+            f"{_MIN_REASON_CHARS} characters explaining the decision — the reviewer "
+            f"sees only this."
+        )
+    if action == "deprecate" and not any(k in text.lower() for k in _REMOVAL_KEYWORDS):
+        return (
+            "Error: a DEPRECATE reason must state what was removed or replaced, citing "
+            "the PRD section that confirms it. If the feature still exists but changed, "
+            "use action='update' instead."
+        )
+    return None
+
+
+_DUP_WARN_SCORE = 0.88
+_DUP_BLOCK_SCORE = 0.93
+
+
+def _duplicate_verdict(similar: list[dict]) -> str | None:
+    """
+    Decide what to tell the agent about near-identical existing tests.
+
+    None means proceed. A returned string is shown to the agent; one containing
+    BLOCKED means the CREATE was refused. Split from the search itself so the
+    thresholds are testable without Elasticsearch.
+    """
+    ranked = sorted(similar, key=lambda t: t.get("score") or 0.0, reverse=True)
+    if not ranked:
+        return None
+
+    lines = ["Very similar tests already exist. Consider UPDATE instead of CREATE:"]
+    lines += [
+        f"  [{t.get('jira_key')}] {t.get('summary')} (score: {(t.get('score') or 0.0):.3f})"
+        for t in ranked[:3]
+    ]
+
+    if (ranked[0].get("score") or 0.0) >= _DUP_BLOCK_SCORE:
+        return "\n".join(lines) + (
+            "\n[BLOCKED — too similar to an existing test. Record an UPDATE against the "
+            "closest match, or a QUESTION if you cannot tell them apart.]"
+        )
+    return "\n".join(lines) + (
+        "\nIf this genuinely covers different behaviour, record it again and state in the "
+        "reason how it differs from the tests above."
+    )
+
+
+# Similarity at which a chunk from a DIFFERENT document counts as covering a test.
+# Scores here are Elasticsearch KNN cosine scores, (1 + cos) / 2, so 0.75 is cosine 0.5 —
+# related subject matter rather than a paraphrase. Deliberately loose: the output is a
+# prompt to go and check, not an automatic refusal.
+_CROSS_PRD_SCORE = float(os.environ.get("QA_CROSS_PRD_SCORE", "0.75"))
+_CROSS_PRD_TOP_K = int(os.environ.get("QA_CROSS_PRD_TOP_K", "8"))
+
+
+def _cross_prd_verdict(matches: list[dict], current_source_id: str) -> str | None:
+    """
+    Warn when a test about to be deprecated looks covered by a different document.
+
+    None means proceed. This is the check the deprecation rules refer to when they say
+    absence from *this* PRD is not absence from the corpus: the agent analyses one
+    document at a time, so without it "I could not find the feature" cannot be
+    distinguished from "the feature is documented elsewhere".
+
+    Advisory, never a block. A test genuinely being retired often still has stale
+    documentation somewhere, and refusing the decision outright would make the
+    deprecation path unusable — the agent is told to look and to say what it found.
+    """
+    others: dict[str, dict] = {}
+    for m in matches:
+        source = m.get("source_id")
+        score = m.get("score") or 0.0
+        if not source or source == current_source_id or score < _CROSS_PRD_SCORE:
+            continue
+        if source not in others or score > (others[source].get("score") or 0.0):
+            others[source] = m
+    if not others:
+        return None
+
+    ranked = sorted(others.values(), key=lambda m: m.get("score") or 0.0, reverse=True)
+    lines = ["Hold on — other documents appear to describe this behaviour:"]
+    for m in ranked[:3]:
+        heading = m.get("section_heading") or "(no heading)"
+        title = m.get("doc_title") or m.get("source_id")
+        lines.append(f"  {m['source_id']} — {title} › {heading} (score: {m['score']:.3f})")
+    lines.append(
+        "Deprecating removes the test everywhere, not just from this PRD's scope. Read "
+        "those sections before continuing. If they do not in fact cover this test, record "
+        "the DEPRECATE again and say in the reason why they do not. If you cannot tell, "
+        "record a QUESTION instead."
+    )
+    return "\n".join(lines)
+
+
+_RRF_RANK_CONSTANT = int(os.environ.get("QA_AGENT_RRF_RANK_CONSTANT", "60"))
+
+
+def _rrf_merge_results(result_lists: list[list[dict]]) -> list[dict]:
+    """
+    Fuse several result lists by Reciprocal Rank Fusion, de-duplicating on jira_key.
+
+    Used when one requirement is searched with several phrasings. RRF rewards
+    consensus: a test that surfaces for every phrasing outranks one that happens to
+    top a single odd query. It is rank-based, so the incomparable score scales of
+    different queries never have to be normalised.
+
+    Note the asymmetry with validate_prd_data / build_preview, which merge the same
+    kind of multi-query result by taking each test's best score instead. That path
+    feeds eval/benchmark.py, so changing it moves the retrieval baseline; the two
+    should be unified once a post-W1 baseline has been measured.
+    """
+    scores: dict[str, float] = {}
+    docs: dict[str, dict] = {}
+    for results in result_lists:
+        for rank, r in enumerate(results, start=1):
+            key = r.get("jira_key")
+            if not key:
+                continue
+            scores[key] = scores.get(key, 0.0) + 1.0 / (rank + _RRF_RANK_CONSTANT)
+            # Keep the record that scored best on its own query — it carries the
+            # richest field set for the reranker to read.
+            if key not in docs or (r.get("score") or 0.0) > (docs[key].get("score") or 0.0):
+                docs[key] = r
+
+    # Copy before rewriting `score`: the caller still owns the lists it passed in, and
+    # overwriting their per-query scores in place would corrupt anything that reads them
+    # afterwards (diagnostics, a second merge, or the validate path if the two are unified).
+    merged = [dict(d) for d in docs.values()]
+    for r in merged:
+        r["score"] = round(scores[r["jira_key"]], 6)
+    merged.sort(key=lambda r: r["score"], reverse=True)
+    return merged
+
+
 def _strip_frontmatter(text: str) -> str:
     """
     Drop a leading YAML frontmatter block. The knowledge bundle in prompts/ carries
@@ -422,10 +607,16 @@ _DEPRECATION = _load_prompt("deprecation-rules.md")
 _SYSTEM_PROMPT_TEMPLATE = """You are an expert QA analyst reviewing test coverage against a Product Requirements Document (PRD).
 
 You have access to tools. Use them in this order:
-1. Call `read_prd_document` to get the full PRD content
-2. For each feature/requirement you identify, call `search_tests` to find relevant existing tests
-3. Call `get_test_details` for any test you want to inspect more closely
-4. Call `record_decision` for each conclusion you reach — do this as you go, not all at the end
+1. Call `list_prd_sections` FIRST to see every section and which are testable. It is short —
+   keep it in context and treat it as your checklist for the run.
+2. Call `read_prd_document` to get the full PRD content
+3. For each feature/requirement you identify, call `search_tests` to find relevant existing tests
+4. Call `get_test_details` for any test you want to inspect more closely
+5. Call `record_decision` for each conclusion you reach — do this as you go, not all at the end
+
+Before you finish, check the list from step 1: every section marked [testable] should have at
+least one decision. Record a QUESTION for any you could not resolve rather than leaving it out —
+a section with no decision is indistinguishable from one you never looked at.
 
 ## Your Analysis Goal
 For every requirement in the PRD, determine:
@@ -674,6 +865,9 @@ def _make_tools(prd_source_id: str, module: list[str] | None,
     _seen_jira_keys: set[str] = set()       # keys returned by search_tests or get_test_details
     # One decision per (issue key + normalized section) or per (create + section + summary slug)
     _decided_identities: dict[tuple, str] = {}
+    # (guard_name, decision_identity) pairs already warned about this run. Advisory
+    # guards fire once so "go and check, then record it again" is actually followable.
+    _advised: set[tuple] = set()
     _decision_count: dict[str, int] = {"keep": 0, "update": 0, "deprecate": 0, "create": 0, "question": 0}
 
     def _decision_identity(
@@ -753,7 +947,10 @@ def _make_tools(prd_source_id: str, module: list[str] | None,
         by_heading: dict[str, list[dict]] = {}
         cur = ""
         for s in chunks:
-            h = (s.get("section_heading") or "").strip()
+            # Sanitise per chunk, before the join below. Doing it after would rewrite
+            # a carried table header in one chunk but not its neighbour, and the
+            # header de-duplication compares those headers for equality.
+            h = _sanitize_prd_content((s.get("section_heading") or "").strip())
             if h:
                 cur = h
             key = cur or "(no heading)"
@@ -768,7 +965,10 @@ def _make_tools(prd_source_id: str, module: list[str] | None,
             # A table spanning several chunks repeats its header in each one so the
             # chunk stands alone in retrieval. Re-joined into one document that
             # header is duplication that splits one table into several.
-            body = join_chunk_texts([s.get("chunk_text") or "" for s in by_heading[heading]])
+            body = join_chunk_texts([
+                _sanitize_prd_content(s.get("chunk_text") or "")
+                for s in by_heading[heading]
+            ])
             return f"### {heading}\n{body}" if heading != "(no heading)" else body
 
         # ── Single-section request ──
@@ -824,32 +1024,53 @@ def _make_tools(prd_source_id: str, module: list[str] | None,
         return header + "\n\n---\n\n".join(included)
 
     @tool
-    def search_tests(query: str, top_k: int = 20) -> str:
+    def search_tests(query: str, top_k: int = 20,
+                     extra_queries: list[str] | None = None) -> str:
         """
         Search for existing test cases relevant to a feature or requirement.
         Uses hybrid semantic + keyword search.
 
         Args:
-            query:  A description of the feature or requirement to find tests for.
-                    Be specific — e.g. "one-step checkout with saved address" not just "checkout".
-            top_k:  Number of results to return (default 20, max 50).
+            query:         A description of the feature or requirement to find tests for.
+                           Be specific — e.g. "one-step checkout with saved address" not
+                           just "checkout".
+            top_k:         Number of results to return (default 20, max 50).
+            extra_queries: Optional alternative phrasings of the SAME requirement, up to
+                           three. Results from all of them are fused, and a test that
+                           surfaces for several phrasings ranks higher. Use this when
+                           one wording might miss tests written in different vocabulary
+                           — e.g. query="checkout with promo code" with
+                           extra_queries=["discount code at payment", "voucher applied
+                           to order"]. Do NOT put a different requirement here; search
+                           for that separately.
 
         Returns:
             A numbered list of matching test cases with jira_key, summary, module, and labels.
         """
         top_k = min(top_k, 50)
-        query_vec = embed_client.embed_query(query)
         # Over-retrieve for reranking (3x candidates), then rerank down to top_k
         retrieval_k = top_k * 3 if reranker else top_k
-        results = es_store.search_hybrid(
-            query_embedding=query_vec,
-            keyword_query=query,
-            top_k=retrieval_k,
-            module_filter=module,
-        )
+
+        queries = [query] + [q for q in (extra_queries or []) if q and q.strip()][:3]
+
+        result_lists: list[list[dict]] = []
+        for q in queries:
+            result_lists.append(es_store.search_hybrid(
+                query_embedding=embed_client.embed_query(q),
+                keyword_query=q,
+                top_k=retrieval_k,
+                module_filter=module,
+            ))
+
+        if len(result_lists) > 1:
+            results = _rrf_merge_results(result_lists)[:retrieval_k]
+        else:
+            results = result_lists[0]
+
         if not results:
             return "No matching tests found."
-        # Cross-encoder reranking for precision
+        # Cross-encoder reranking for precision. Scored against the primary query — the
+        # variants exist to widen recall, not to redefine what was asked for.
         if reranker:
             results = reranker.rerank(query, results, top_k=top_k)
 
@@ -914,6 +1135,7 @@ def _make_tools(prd_source_id: str, module: list[str] | None,
         new_test_steps: str | None = None,
         prd_section: str | None = None,
         updated_steps: list[dict] | None = None,
+        confidence: str | None = None,
     ) -> str:
         """
         Record a coverage decision for human review.
@@ -937,10 +1159,18 @@ def _make_tools(prd_source_id: str, module: list[str] | None,
                                 {"action": "...", "data": "...", "expectedResult": "..."}.
                                 If you are not rewriting every step, leave this out and
                                 describe the change in suggested_changes instead.
+            confidence:         How sure you are: "high", "medium" or "low". Reviewers
+                                sort by this, so be honest — "low" on a genuinely
+                                ambiguous call is more useful than false certainty.
         """
         valid_actions = ("keep", "update", "deprecate", "create", "question")
         if action not in valid_actions:
             return f"Error: action must be one of {valid_actions}"
+
+        # ── Guardrail: the reason is the whole audit trail ──
+        reason_error = _check_reason_quality(action, reason)
+        if reason_error:
+            return reason_error
         if action in ("keep", "update", "deprecate") and not jira_key:
             return f"Error: jira_key is required for action={action!r}"
         if action == "update":
@@ -964,8 +1194,69 @@ def _make_tools(prd_source_id: str, module: list[str] | None,
                 f"Search for this test first, or verify the key is correct."
             )
 
-        # ── Guardrail: one decision per (jira_key, prd section) or per create identity ──
         ident = _decision_identity(action, jira_key, prd_section, new_test_summary)
+
+        def _advise(guard: str, verdict: str | None) -> str | None:
+            """
+            Return an advisory once per decision identity, then stand aside.
+
+            These guards tell the agent to go and check something, then record the
+            decision again. Re-running the same lookup would produce the same advisory
+            forever, so the instruction would be impossible to follow and the decision
+            could never be recorded. Firing once makes "look, then re-submit" real,
+            while still forcing the agent past the evidence at least once.
+            """
+            if not verdict:
+                return None
+            key = (guard, ident)
+            if key in _advised:
+                return None
+            _advised.add(key)
+            return verdict
+
+        # ── Guardrail: don't create a test that already exists ──
+        # Runs before the identity check so a blocked CREATE is not recorded as decided
+        # and the agent can still record an UPDATE for the same section.
+        if action == "create" and new_test_summary:
+            try:
+                dup_vec = embed_client.embed_query(new_test_summary)
+                similar = es_store.search_similar_tests(
+                    dup_vec, top_k=3, module_filter=module, min_score=_DUP_WARN_SCORE,
+                )
+                verdict = _duplicate_verdict(similar)
+            except Exception as exc:
+                # A failed lookup must not block a legitimate CREATE.
+                logger.warning("CREATE duplicate check failed (allowing): %s", exc)
+                verdict = None
+            if verdict:
+                # A near-identical match is refused outright and never clears: the agent
+                # is told to record an UPDATE instead, which it can still do.
+                if "BLOCKED" in verdict:
+                    return verdict
+                advisory = _advise("duplicate", verdict)
+                if advisory:
+                    return advisory
+
+        # ── Guardrail: is this test covered by a different document? ──
+        # The agent sees one PRD at a time, so "the feature is not in this document" is
+        # not "the feature is undocumented". Deprecating removes the test everywhere.
+        if action == "deprecate" and jira_key:
+            try:
+                test_vec = es_store.get_test_embedding(jira_key)
+                cross = _cross_prd_verdict(
+                    es_store.search_similar_prd_chunks(
+                        test_vec, top_k=_CROSS_PRD_TOP_K,
+                    ) if test_vec else [],
+                    prd_source_id,
+                )
+            except Exception as exc:
+                logger.warning("Cross-document check failed (allowing): %s", exc)
+                cross = None
+            advisory = _advise("cross_prd", cross)
+            if advisory:
+                return advisory
+
+        # ── Guardrail: one decision per (jira_key, prd section) or per create identity ──
         if ident in _decided_identities:
             prev_action = _decided_identities[ident]
             return (
@@ -1001,6 +1292,7 @@ def _make_tools(prd_source_id: str, module: list[str] | None,
             "questions":       [reason] if action == "question" else None,
             "prd_source":      prd_source_id,
             "prd_section":     prd_section,
+            "confidence":      confidence,
         })
 
         # ── Guardrail: track this decision ──
@@ -1074,7 +1366,107 @@ def _make_tools(prd_source_id: str, module: list[str] | None,
         _knowledge_reads.add(name)
         return f"# Knowledge document: {name}\n\n{body}"
 
+    @tool
+    def list_prd_sections() -> str:
+        """
+        List every section in the PRD with its size and whether it is testable.
+
+        Call this FIRST, before read_prd_document. It is small enough to keep in
+        context for the whole run, so it doubles as your checklist: every section
+        marked [testable] needs at least one decision by the end.
+
+        Meta sections (Background, Success Metrics, Glossary and similar) are marked
+        [meta] and need no decision.
+        """
+        from elasticsearch import helpers as es_helpers
+
+        chunks: list[dict] = []
+        for hit in es_helpers.scan(
+            es_store._client,
+            index="qa_prd_chunks",
+            query={"query": {"term": {"source_id": prd_source_id}},
+                   "_source": ["section_heading", "chunk_text", "chunk_index",
+                               "chunk_type", "doc_title"]},
+            scroll="2m",
+            size=500,
+        ):
+            chunks.append(hit["_source"])
+            if len(chunks) >= MAX_PRD_CHUNKS:
+                logger.warning(
+                    "PRD %s has >%s chunks — section list truncated",
+                    prd_source_id, MAX_PRD_CHUNKS,
+                )
+                truncated = True
+                break
+        else:
+            truncated = False
+
+        if not chunks:
+            return (
+                f"No document found for source_id={prd_source_id!r}. "
+                "It must be ingested before it can be analysed."
+            )
+
+        chunks.sort(key=lambda c: c.get("chunk_index", 0))
+
+        # Chunks after a heading inherit it, matching how the chunker emits them.
+        ordered: list[str] = []
+        words: dict[str, int] = {}
+        kinds: dict[str, set] = {}
+        current = ""
+        for c in chunks:
+            heading = (c.get("section_heading") or "").strip()
+            if heading:
+                current = heading
+            key = current or "(no heading)"
+            if key not in words:
+                words[key] = 0
+                kinds[key] = set()
+                ordered.append(key)
+            words[key] += len((c.get("chunk_text") or "").split())
+            if c.get("chunk_type"):
+                kinds[key].add(c["chunk_type"])
+
+        if _focus_norm is not None:
+            ordered = [h for h in ordered if _chunk_heading_matches_focus(h)]
+            if not ordered:
+                return (
+                    "No sections matched the incremental focus list. Verify the heading "
+                    "text matches the changed sections from the diff."
+                )
+
+        doc_title = chunks[0].get("doc_title") or prd_source_id
+        lines = [f"# {doc_title} — {len(ordered)} sections", ""]
+        testable = 0
+        for i, heading in enumerate(ordered, 1):
+            meta = _is_meta_heading(heading)
+            if not meta:
+                testable += 1
+            tag = "[meta]" if meta else "[testable]"
+            # Content mix is a parsing signal: a section you expect to be a spec table
+            # showing only prose means the source conversion flattened it.
+            mix = "/".join(sorted(kinds[heading])) if kinds[heading] else "?"
+            lines.append(f"{i:>3}. {tag:<10} {heading}  (~{words[heading]} words, {mix})")
+
+        lines += [
+            "",
+            f"{testable} testable section(s) need a decision; "
+            f"{len(ordered) - testable} are meta and do not.",
+        ]
+        if truncated:
+            lines.append(
+                f"WARNING: this document exceeds {MAX_PRD_CHUNKS} chunks, so sections "
+                "beyond that point are NOT listed above. Say so in your final summary — "
+                "do not report coverage as complete."
+            )
+        lines.append(
+            "Next: call read_prd_document to read the content, then work through the "
+            "testable sections in order."
+        )
+        return "\n".join(lines)
+
     return [
+        list_prd_sections,
         read_prd_document,
         search_tests,
         get_test_details,
@@ -1201,6 +1593,48 @@ def _finalize_usage(usage: dict, provider: str, model: str) -> dict:
     return out
 
 
+_TRIAGE_TURNS_AHEAD = int(os.environ.get("QA_AGENT_TRIAGE_TURNS_AHEAD", "10"))
+
+
+def _triage_turn(max_turns: int, ahead: int = None) -> int | None:
+    """
+    Turn index at which to warn, or None when the run is too short to be worth it.
+
+    Naively using `max_turns - ahead` warns on turn 0 whenever max_turns <= ahead —
+    telling the agent to stop starting new work before it has done any, so it records
+    nothing at all. That is a realistic configuration: .env.example recommends
+    QA_AGENT_MAX_TURNS=20 for local models and lowering it further for slow ones.
+
+    Short runs still get a warning, just proportionally later.
+    """
+    ahead = _TRIAGE_TURNS_AHEAD if ahead is None else ahead
+    if max_turns <= 2:
+        return None
+    if max_turns > ahead:
+        return max_turns - ahead
+    return max(1, int(max_turns * 0.7))
+
+
+def _triage_message(turns_left: int) -> str:
+    """
+    The message injected before the turn limit.
+
+    Names what to do with the time left rather than only that time is short: finish
+    the sections already in context, and record a QUESTION for anything unreachable
+    so an unanalysed section is visible as a question instead of silently absent.
+    """
+    return (
+        f"TURN LIMIT APPROACHING — {turns_left} turns remain in this run.\n"
+        "Change strategy now:\n"
+        "1. Do not start new searches or read new sections.\n"
+        "2. Record decisions for the sections already in your context.\n"
+        "3. For any testable section you cannot reach, record action='question' "
+        "naming the section and saying it was not analysed — an unanalysed section "
+        "must not look like a section you found nothing wrong with.\n"
+        "4. Prioritise by impact: payment, authentication and other core flows first."
+    )
+
+
 def _run_agent_loop(
     llm_with_tools,
     tools_by_name: dict,
@@ -1231,8 +1665,25 @@ def _run_agent_loop(
     nudges_used = 0
     usage = _new_usage()
 
+    triage_warned = False
+    triage_turn = _triage_turn(max_turns)
+
     for turn in range(max_turns):
         messages = _shrink_stale_prd_reads(messages)
+
+        # ── Triage warning ──
+        # Hitting max_turns mid-analysis truncates wherever the agent happened to be,
+        # so the sections it never reached are indistinguishable from sections it
+        # decided were fine. Warning ahead of the wall lets it spend the remaining
+        # turns closing out rather than starting new work.
+        if not triage_warned and triage_turn is not None and turn == triage_turn:
+            turns_left = max_turns - turn
+            messages.append(HumanMessage(content=_triage_message(turns_left)))
+            triage_warned = True
+            logger.info(
+                "Agent turn %s: triage warning injected — %s turns remaining",
+                turn + 1, turns_left,
+            )
 
         # ── Token budget check ──
         current_tokens = _count_message_tokens(messages)
@@ -1685,8 +2136,11 @@ def build_preview(
         seen_headings: set[str] = set()
         for h in hits:
             s       = h["_source"]
-            heading = (s.get("section_heading") or "").strip()
-            text    = s.get("chunk_text", "")
+            heading = _sanitize_prd_content((s.get("section_heading") or "").strip())
+            # /analyze/preview promises to show the exact prompt that would be sent. If
+            # it skipped sanitisation the preview would differ from the real thing
+            # precisely on the content worth previewing.
+            text    = _sanitize_prd_content(s.get("chunk_text", ""))
             sections.append(f"### {heading}\n{text}" if heading else text)
             # Skip meta-sections and near-empty chunks — they produce retrieval noise
             if (heading
